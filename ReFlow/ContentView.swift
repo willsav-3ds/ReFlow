@@ -3,30 +3,32 @@ import AppKit
 
 struct LauncherView: View {
     @StateObject private var searchEngine = SearchEngine()
+    @ObservedObject private var shortcuts = ShortcutStore.shared
+    @ObservedObject private var windowController = LauncherWindowController.shared
     @State private var searchText = ""
     @State private var selectedResult: SearchResult?
     @State private var showingFileActions = false
     @State private var fileToManage: URL?
+    @State private var launcherKeyMonitor: Any?
     @FocusState private var isSearchFieldFocused: Bool
-    
+
     var body: some View {
         VStack(spacing: 0) {
             // Search field
             HStack {
-                Image(systemName: searchEngine.searchMode == .emoji ? "face.smiling" : "magnifyingglass")
+                Image(systemName: searchBarIconName)
                     .foregroundStyle(.secondary)
-                
-                TextField(searchEngine.searchMode == .emoji ? "Search emoji..." : "Search apps, files, scripts, or window actions...", text: $searchText)
+
+                TextField(searchBarPlaceholder, text: $searchText)
                     .textFieldStyle(.plain)
                     .font(.system(size: 22, weight: .light))
                     .focused($isSearchFieldFocused)
                     .onSubmit {
                         if let firstResult = searchEngine.results.first {
-                            firstResult.execute()
-                            closeWindow()
+                            execute(firstResult)
                         }
                     }
-                
+
                 if !searchText.isEmpty {
                     Button(action: { searchText = "" }) {
                         Image(systemName: "xmark.circle.fill")
@@ -34,25 +36,35 @@ struct LauncherView: View {
                     }
                     .buttonStyle(.plain)
                 }
-                
+
                 // Mode toggle
                 Button(action: { searchEngine.toggleMode() }) {
                     Image(systemName: searchEngine.searchMode == .emoji ? "command" : "face.smiling")
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
-                .help(searchEngine.searchMode == .emoji ? "Switch to launcher" : "Switch to emoji search")
+                .help(searchEngine.searchMode == .emoji
+                      ? "Switch to launcher (\(shortcuts.binding(for: .toggleEmojiMode).displayString))"
+                      : "Switch to emoji search (\(shortcuts.binding(for: .toggleEmojiMode).displayString))")
+
+                // Settings
+                Button(action: openSettings) {
+                    Image(systemName: "gearshape")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Settings (\(shortcuts.binding(for: .openSettings).displayString))")
             }
             .padding()
-            .background(.ultraThinMaterial)
-            
+            .background(WindowDragHandle())
+
             Divider()
-            
+
             // Results list
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(searchEngine.results) { result in
-                        ResultRow(result: result)
+                    ForEach(Array(searchEngine.results.enumerated()), id: \.element.id) { index, result in
+                        ResultRow(result: result, isSelected: index == 0)
                             .contentShape(Rectangle())
                             .onTapGesture {
                                 if result.type == .file {
@@ -62,23 +74,33 @@ struct LauncherView: View {
                                     }
                                     showingFileActions = true
                                 } else {
-                                    result.execute()
-                                    closeWindow()
+                                    execute(result)
                                 }
                             }
                             .contextMenu {
-                                if result.type == .file, let subtitle = result.subtitle {
+                                if result.type == .file, let fileURL = result.fileURL {
                                     Button("Open") {
-                                        result.execute()
+                                        execute(result)
+                                    }
+                                    Button("Show in Finder (\(shortcuts.binding(for: .showInFinderTopResult).displayString) for top result)") {
+                                        FileOps.showInFinder(fileURL)
                                         closeWindow()
                                     }
-                                    Button("Show in Finder") {
-                                        NSWorkspace.shared.selectFile(subtitle, inFileViewerRootedAtPath: "")
-                                        closeWindow()
+                                    Button("Move to... (\(shortcuts.binding(for: .moveTopResult).displayString) for top result)") {
+                                        FileOps.moveWithPicker(fileURL) {
+                                            searchEngine.search(query: searchText)
+                                        }
                                     }
                                     Divider()
-                                    Button("Move to Trash", role: .destructive) {
-                                        FileManager.default.trashItem(at: URL(fileURLWithPath: subtitle))
+                                    Button("Move to Trash (\(shortcuts.binding(for: .trashTopResult).displayString) for top result)", role: .destructive) {
+                                        FileOps.trash(fileURL)
+                                        searchEngine.search(query: searchText)
+                                    }
+                                    Divider()
+                                }
+                                if let rankingKey = result.rankingKey {
+                                    Button("Reset Ranking") {
+                                        RankingStore.shared.reset(rankingKey)
                                         searchEngine.search(query: searchText)
                                     }
                                 }
@@ -87,11 +109,22 @@ struct LauncherView: View {
                 }
             }
         }
+        .background(.regularMaterial)
         .frame(width: 600, height: 450)
         .onChange(of: searchText) { _, newValue in
             searchEngine.search(query: newValue)
         }
         .onAppear {
+            installLauncherKeyMonitor()
+        }
+        .onDisappear {
+            removeLauncherKeyMonitor()
+        }
+        .onChange(of: windowController.isVisible) { _, visible in
+            // The panel and this view are reused across show/hide cycles, so refresh
+            // explicitly on every reopen instead of relying on onAppear (which won't refire).
+            guard visible else { return }
+            searchText = ""
             isSearchFieldFocused = true
             searchEngine.search(query: "")
         }
@@ -103,15 +136,147 @@ struct LauncherView: View {
             }
         }
     }
-    
+
+    // MARK: - Keyboard-driven top-result actions
+
+    private func installLauncherKeyMonitor() {
+        guard launcherKeyMonitor == nil else { return }
+        launcherKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // Escape: back out of File Search/emoji mode first, then close the launcher.
+            if event.keyCode == 53 {
+                if searchEngine.searchMode != .launcher {
+                    searchEngine.searchMode = .launcher
+                    searchText = ""
+                    searchEngine.search(query: "")
+                } else {
+                    closeWindow()
+                }
+                return nil
+            }
+
+            guard let action = shortcuts.action(matching: event, scope: .launcher) else {
+                return event
+            }
+            handleLauncherAction(action)
+            return nil
+        }
+    }
+
+    private func removeLauncherKeyMonitor() {
+        if let monitor = launcherKeyMonitor {
+            NSEvent.removeMonitor(monitor)
+            launcherKeyMonitor = nil
+        }
+    }
+
+    private func handleLauncherAction(_ action: ShortcutAction) {
+        switch action {
+        case .toggleEmojiMode:
+            searchEngine.toggleMode()
+        case .trashTopResult:
+            guard let fileURL = searchEngine.results.first?.fileURL else { return }
+            FileOps.trash(fileURL)
+            searchEngine.search(query: searchText)
+        case .moveTopResult:
+            guard let fileURL = searchEngine.results.first?.fileURL else { return }
+            FileOps.moveWithPicker(fileURL) {
+                searchEngine.search(query: searchText)
+            }
+        case .showInFinderTopResult:
+            guard let fileURL = searchEngine.results.first?.fileURL else { return }
+            FileOps.showInFinder(fileURL)
+        case .openSettings:
+            openSettings()
+        default:
+            break
+        }
+    }
+
+    private func openSettings() {
+        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+    }
+
     private func closeWindow() {
         searchText = ""
-        NSApp.hide(nil)
+        LauncherWindowController.shared.hide()
+    }
+
+    /// Runs a result's action. Mode-switch entries like "File Search" (`.command`) stay
+    /// open since nothing was actually launched; everything else closes the window after.
+    private func execute(_ result: SearchResult) {
+        result.execute()
+        if result.type != .command {
+            closeWindow()
+        }
+    }
+
+    private var searchBarIconName: String {
+        switch searchEngine.searchMode {
+        case .emoji: return "face.smiling"
+        case .fileSearch: return "folder"
+        case .launcher: return "magnifyingglass"
+        }
+    }
+
+    private var searchBarPlaceholder: String {
+        switch searchEngine.searchMode {
+        case .emoji: return "Search emoji..."
+        case .fileSearch: return "Search files or enter a path..."
+        case .launcher: return "Search apps, scripts, or type fs for File Search..."
+        }
+    }
+}
+
+/// Lets the borderless launcher window be dragged from empty parts of its own content,
+/// since a SwiftUI-hosted window covers the whole frame and `isMovableByWindowBackground`
+/// alone has nothing left to claim as "background."
+private struct WindowDragHandle: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { DragView() }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    private class DragView: NSView {
+        override func mouseDown(with event: NSEvent) {
+            window?.performDrag(with: event)
+        }
+    }
+}
+
+/// Shared file operations used by both the context menu and the keyboard shortcuts
+/// that act on the top search result.
+enum FileOps {
+    static func trash(_ url: URL) {
+        try? FileManager.default.trashItem(at: url, resultingItemURL: nil)
+    }
+
+    static func showInFinder(_ url: URL) {
+        NSWorkspace.shared.selectFile(url.path, inFileViewerRootedAtPath: "")
+    }
+
+    static func moveWithPicker(_ url: URL, completion: (() -> Void)? = nil) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.prompt = "Move Here"
+
+        if panel.runModal() == .OK, let destination = panel.url {
+            let destinationURL = destination.appendingPathComponent(url.lastPathComponent)
+            try? FileManager.default.moveItem(at: url, to: destinationURL)
+            completion?()
+        }
+    }
+
+    static func duplicate(_ url: URL) {
+        let destinationURL = url.deletingLastPathComponent()
+            .appendingPathComponent(url.deletingPathExtension().lastPathComponent + " copy")
+            .appendingPathExtension(url.pathExtension)
+        try? FileManager.default.copyItem(at: url, to: destinationURL)
     }
 }
 
 struct ResultRow: View {
     let result: SearchResult
+    let isSelected: Bool
     @State private var isHovering = false
     
     var body: some View {
@@ -158,7 +323,17 @@ struct ResultRow: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(isHovering ? Color.accentColor.opacity(0.1) : Color.clear)
+        .background(
+            isHovering ? Color.accentColor.opacity(0.1) :
+            isSelected ? Color.accentColor.opacity(0.15) : Color.clear
+        )
+        .overlay(alignment: .leading) {
+            if isSelected {
+                Rectangle()
+                    .fill(Color.accentColor)
+                    .frame(width: 3)
+            }
+        }
         .onHover { hovering in
             isHovering = hovering
         }
@@ -193,23 +368,27 @@ struct FileActionsView: View {
                 .buttonStyle(.borderedProminent)
                 
                 Button("Show in Finder") {
-                    NSWorkspace.shared.selectFile(fileURL.path, inFileViewerRootedAtPath: "")
+                    FileOps.showInFinder(fileURL)
                     isPresented = false
                     onComplete()
                 }
-                
+
                 Button("Move to...") {
-                    showMovePicker()
+                    FileOps.moveWithPicker(fileURL) {
+                        isPresented = false
+                        onComplete()
+                    }
                 }
-                
+
                 Button("Duplicate") {
-                    duplicateFile()
+                    FileOps.duplicate(fileURL)
+                    isPresented = false
                 }
-                
+
                 Divider()
-                
+
                 Button("Move to Trash", role: .destructive) {
-                    try? FileManager.default.trashItem(at: fileURL, resultingItemURL: nil)
+                    FileOps.trash(fileURL)
                     isPresented = false
                     onComplete()
                 }
@@ -218,29 +397,6 @@ struct FileActionsView: View {
         }
         .padding()
         .frame(width: 300, height: 400)
-    }
-    
-    func showMovePicker() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.canCreateDirectories = true
-        panel.prompt = "Move Here"
-        
-        if panel.runModal() == .OK, let destination = panel.url {
-            let destinationURL = destination.appendingPathComponent(fileURL.lastPathComponent)
-            try? FileManager.default.moveItem(at: fileURL, to: destinationURL)
-            isPresented = false
-            onComplete()
-        }
-    }
-    
-    func duplicateFile() {
-        let destinationURL = fileURL.deletingLastPathComponent()
-            .appendingPathComponent(fileURL.deletingPathExtension().lastPathComponent + " copy")
-            .appendingPathExtension(fileURL.pathExtension)
-        try? FileManager.default.copyItem(at: fileURL, to: destinationURL)
-        isPresented = false
     }
 }
 

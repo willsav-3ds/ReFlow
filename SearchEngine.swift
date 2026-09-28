@@ -3,36 +3,96 @@ import AppKit
 import UniformTypeIdentifiers
 import Combine
 
+enum SearchMode {
+    case launcher
+    case emoji
+    case fileSearch
+}
+
 @MainActor
 class SearchEngine: ObservableObject {
     @Published var results: [SearchResult] = []
-    
+    @Published var searchMode: SearchMode = .launcher
+
     private var searchTask: Task<Void, Never>?
-    
-    var customScriptDirectory: URL {
+    private var lastQuery: String = ""
+
+    /// Built once on first use instead of re-walking `/Applications` on every keystroke.
+    private var cachedApps: [CachedApp]?
+    private var iconCache: [String: NSImage] = [:]
+
+    private struct CachedApp {
+        let title: String
+        let path: String
+        let icon: NSImage
+    }
+
+    /// Folders scripts are searched in. Fully user-managed (Settings → Scripts) — nothing
+    /// is scanned automatically beyond this list, defaulting to `~/Scripts` until edited.
+    /// Static (not per-instance) so Settings can read/write it without needing a
+    /// `SearchEngine` of its own — it's really just a thin, typed view onto UserDefaults.
+    static var scriptSearchPaths: [String] {
         get {
-            if let savedPath = UserDefaults.standard.string(forKey: "customScriptDirectory") {
-                return URL(fileURLWithPath: savedPath)
+            if let saved = UserDefaults.standard.stringArray(forKey: scriptPathsDefaultsKey) {
+                return saved
             }
-            return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Scripts")
+            return [FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Scripts").path]
         }
         set {
-            UserDefaults.standard.set(newValue.path, forKey: "customScriptDirectory")
+            UserDefaults.standard.set(newValue, forKey: scriptPathsDefaultsKey)
         }
     }
+    private static let scriptPathsDefaultsKey = "scriptSearchPaths"
     
     func search(query: String) {
         // Cancel previous search
         searchTask?.cancel()
-        
+        lastQuery = query
+
         searchTask = Task {
-            if query.isEmpty {
-                // Show recent/default items
-                results = await getDefaultResults()
-            } else {
-                results = await performSearch(query: query)
+            // Debounce: wait a beat for more keystrokes before doing any real work.
+            // Skipped for an empty query so clearing the field shows defaults instantly.
+            if !query.isEmpty {
+                do {
+                    try await Task.sleep(for: .milliseconds(120))
+                } catch {
+                    return // superseded before the debounce even elapsed
+                }
+            }
+            guard !Task.isCancelled else { return }
+
+            let newResults: [SearchResult]
+            switch searchMode {
+            case .emoji:
+                newResults = searchEmojis(query: query)
+            case .fileSearch:
+                // Don't dump every file in Documents the instant the mode opens.
+                newResults = query.isEmpty ? [] : await performFileSearch(query: query)
+            case .launcher:
+                if query.isEmpty {
+                    // Show recent/default items
+                    newResults = await getDefaultResults()
+                } else if query.trimmingCharacters(in: .whitespaces).lowercased() == "fs" {
+                    newResults = [fileSearchCommandResult()]
+                } else {
+                    newResults = await performSearch(query: query)
+                }
+            }
+
+            // A slower, superseded search must never clobber fresher results.
+            guard !Task.isCancelled else { return }
+            // Usage-based ranking: nudge frequently-launched items up, without letting
+            // the boost outweigh genuine text relevance (see RankingStore.boostScore).
+            results = newResults.sorted {
+                $0.relevance + RankingStore.shared.boostScore(for: $0.rankingKey) >
+                $1.relevance + RankingStore.shared.boostScore(for: $1.rankingKey)
             }
         }
+    }
+
+    func toggleMode() {
+        searchMode = (searchMode == .emoji) ? .launcher : .emoji
+        search(query: lastQuery)
     }
     
     private func performSearch(query: String) async -> [SearchResult] {
@@ -48,19 +108,74 @@ class SearchEngine: ObservableObject {
         // Search applications
         let apps = await searchApplications(query: query)
         allResults.append(contentsOf: apps)
-        
-        // Search files
-        let files = await searchFiles(query: query)
-        allResults.append(contentsOf: files)
-        
+
         // Check for script commands
         let scripts = await searchScripts(query: query)
         allResults.append(contentsOf: scripts)
-        
+
+        // Search quick links
+        let quickLinks = searchQuickLinks(query: query)
+        allResults.append(contentsOf: quickLinks)
+
         // Sort by relevance
         return allResults.sorted { $0.relevance > $1.relevance }
     }
+
+    private func searchQuickLinks(query: String) -> [SearchResult] {
+        QuickLinkStore.shared.links.compactMap { link in
+            let relevance = Self.calculateRelevance(text: link.name, query: query)
+            guard relevance > 0 else { return nil }
+
+            let target = link.target
+            return SearchResult(
+                title: link.name,
+                subtitle: target,
+                type: .quickLink,
+                systemIcon: "link",
+                relevance: relevance,
+                rankingKey: "quicklink:\(target)",
+                action: {
+                    QuickLinkStore.open(target)
+                }
+            )
+        }
+    }
     
+    private func fileSearchCommandResult() -> SearchResult {
+        SearchResult(
+            title: "File Search",
+            subtitle: "Search files by name or enter a path",
+            type: .command,
+            systemIcon: "folder",
+            relevance: 1.0,
+            action: {
+                self.searchMode = .fileSearch
+                self.search(query: "")
+            }
+        )
+    }
+
+    private func performFileSearch(query: String) async -> [SearchResult] {
+        let expandedPath = (query as NSString).expandingTildeInPath
+        if FileManager.default.fileExists(atPath: expandedPath) {
+            let url = URL(fileURLWithPath: expandedPath)
+            return [SearchResult(
+                title: url.lastPathComponent,
+                subtitle: expandedPath,
+                type: .file,
+                icon: icon(for: expandedPath),
+                relevance: 1.0,
+                fileURL: url,
+                rankingKey: expandedPath,
+                action: {
+                    NSWorkspace.shared.open(url)
+                }
+            )]
+        }
+
+        return await searchFiles(query: query)
+    }
+
     private func getDefaultResults() async -> [SearchResult] {
         // Return frequently used apps
         let appPaths = [
@@ -85,60 +200,75 @@ class SearchEngine: ObservableObject {
                 type: .application,
                 icon: icon,
                 relevance: 0.5,
+                rankingKey: path,
                 action: { NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: path), configuration: NSWorkspace.OpenConfiguration()) }
             )
         }
     }
     
-    private func searchApplications(query: String) async -> [SearchResult] {
+    private func loadApps() async -> [CachedApp] {
+        if let cachedApps { return cachedApps }
+
         let appDirs = [
             "/Applications",
             "/System/Applications",
             "/System/Applications/Utilities",
             FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications").path
         ]
-        
-        var results: [SearchResult] = []
-        
+
+        var apps: [CachedApp] = []
+
         for dir in appDirs {
             guard let enumerator = FileManager.default.enumerator(atPath: dir) else { continue }
-            
+
             for case let file as String in enumerator {
                 guard file.hasSuffix(".app") else { continue }
-                
+
                 let fullPath = (dir as NSString).appendingPathComponent(file)
                 let appName = URL(fileURLWithPath: file).deletingPathExtension().lastPathComponent
-                
-                // Check if matches query
-                let relevance = calculateRelevance(text: appName, query: query)
-                guard relevance > 0 else { continue }
-                
+
                 if let bundle = Bundle(path: fullPath) {
                     let displayName = bundle.infoDictionary?["CFBundleName"] as? String ?? appName
                     let icon = NSWorkspace.shared.icon(forFile: fullPath)
-                    
-                    results.append(SearchResult(
-                        title: displayName,
-                        subtitle: fullPath,
-                        type: .application,
-                        icon: icon,
-                        relevance: relevance,
-                        action: { 
-                            NSWorkspace.shared.openApplication(
-                                at: URL(fileURLWithPath: fullPath),
-                                configuration: NSWorkspace.OpenConfiguration()
-                            )
-                        }
-                    ))
+                    apps.append(CachedApp(title: displayName, path: fullPath, icon: icon))
                 }
-                
+
                 // Don't recurse into .app bundles
-                if file.hasSuffix(".app") {
-                    enumerator.skipDescendants()
-                }
+                enumerator.skipDescendants()
             }
         }
-        
+
+        cachedApps = apps
+        return apps
+    }
+
+    private func searchApplications(query: String) async -> [SearchResult] {
+        let apps = await loadApps()
+        var results: [SearchResult] = []
+
+        for app in apps {
+            if Task.isCancelled { return [] }
+
+            let relevance = Self.calculateRelevance(text: app.title, query: query)
+            guard relevance > 0 else { continue }
+
+            let path = app.path
+            results.append(SearchResult(
+                title: app.title,
+                subtitle: path,
+                type: .application,
+                icon: app.icon,
+                relevance: relevance,
+                rankingKey: path,
+                action: {
+                    NSWorkspace.shared.openApplication(
+                        at: URL(fileURLWithPath: path),
+                        configuration: NSWorkspace.OpenConfiguration()
+                    )
+                }
+            ))
+        }
+
         return results
     }
     
@@ -161,27 +291,32 @@ class SearchEngine: ObservableObject {
             
             var count = 0
             for case let fileURL as URL in enumerator {
+                if Task.isCancelled { return [] }
                 guard count < 20 else { break } // Limit results per directory
-                
+
                 let fileName = fileURL.lastPathComponent
-                let relevance = calculateRelevance(text: fileName, query: query)
-                
-                guard relevance > 0.3 else { continue }
-                
-                let icon = NSWorkspace.shared.icon(forFile: fileURL.path)
-                
+                let textRelevance = Self.calculateRelevance(text: fileName, query: query)
+
+                // Threshold on text relevance alone — recency should never let an
+                // otherwise-irrelevant file leak through, only break ties/near-ties in
+                // favor of whatever was added or changed more recently.
+                guard textRelevance > 0.3 else { continue }
+
+                let icon = icon(for: fileURL.path)
+
                 results.append(SearchResult(
                     title: fileName,
                     subtitle: fileURL.path,
                     type: .file,
                     icon: icon,
-                    relevance: relevance,
+                    relevance: textRelevance + Self.recencyBonus(for: fileURL),
                     fileURL: fileURL,
+                    rankingKey: fileURL.path,
                     action: {
                         NSWorkspace.shared.open(fileURL)
                     }
                 ))
-                
+
                 count += 1
             }
         }
@@ -210,15 +345,12 @@ class SearchEngine: ObservableObject {
             }
         }
         
-        // Search for .sh, .command, .py, .rb scripts in user directories
-        var scriptDirs = [
-            customScriptDirectory, // Use custom directory
-            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents"),
-            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop"),
-        ]
-        
+        // Search only the folders configured in Settings → Scripts — nothing else is
+        // scanned automatically.
+        let scriptDirs = Self.scriptSearchPaths.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+
         let scriptExtensions = ["sh", "command", "py", "rb", "js", "swift"]
-        
+
         for dir in scriptDirs {
             guard let enumerator = FileManager.default.enumerator(
                 at: dir,
@@ -227,10 +359,11 @@ class SearchEngine: ObservableObject {
             ) else { continue }
             
             for case let fileURL as URL in enumerator {
+                if Task.isCancelled { return [] }
                 guard scriptExtensions.contains(fileURL.pathExtension.lowercased()) else { continue }
-                
+
                 let fileName = fileURL.lastPathComponent
-                let relevance = calculateRelevance(text: fileName, query: query)
+                let relevance = Self.calculateRelevance(text: fileName, query: query)
                 
                 guard relevance > 0.3 else { continue }
                 
@@ -240,6 +373,7 @@ class SearchEngine: ObservableObject {
                     type: .script,
                     systemIcon: "terminal.fill",
                     relevance: relevance,
+                    rankingKey: fileURL.path,
                     action: {
                         self.executeScript(at: fileURL)
                     }
@@ -250,7 +384,29 @@ class SearchEngine: ObservableObject {
         return results
     }
     
-    private func calculateRelevance(text: String, query: String) -> Double {
+    private func icon(for path: String) -> NSImage {
+        if let cached = iconCache[path] { return cached }
+        let icon = NSWorkspace.shared.icon(forFile: path)
+        iconCache[path] = icon
+        return icon
+    }
+
+    /// A small, decaying bonus for files added or changed recently — so among similar
+    /// text matches, something downloaded yesterday outranks something untouched for
+    /// years. Capped well below a full relevance tier so it only breaks ties/near-ties,
+    /// never promotes an irrelevant match past a genuine one.
+    static func recencyBonus(for url: URL) -> Double {
+        let values = try? url.resourceValues(forKeys: [.addedToDirectoryDateKey, .contentModificationDateKey])
+        guard let date = values?.addedToDirectoryDate ?? values?.contentModificationDate else {
+            return 0
+        }
+        let ageInDays = max(0, Date().timeIntervalSince(date) / 86400)
+        let maxBonus = 0.3
+        let decayDays = 365.0
+        return max(0, maxBonus - min(ageInDays, decayDays) / decayDays * maxBonus)
+    }
+
+    static func calculateRelevance(text: String, query: String) -> Double {
         let lowerText = text.lowercased()
         let lowerQuery = query.lowercased()
         
@@ -369,20 +525,14 @@ class SearchEngine: ObservableObject {
                 subtitle: emoji.keywords.joined(separator: ", "),
                 type: .emoji,
                 systemIcon: "face.smiling",
+                emoji: emoji.emoji,
                 relevance: emoji.relevance,
+                rankingKey: "emoji:\(emoji.emoji)",
                 action: {
                     // Copy emoji to clipboard
                     let pasteboard = NSPasteboard.general
                     pasteboard.clearContents()
                     pasteboard.setString(emoji.emoji, forType: .string)
-                    
-                    // Show notification
-                    Task { @MainActor in
-                        let notification = NSUserNotification()
-                        notification.title = "Emoji Copied"
-                        notification.informativeText = "\(emoji.emoji) copied to clipboard"
-                        NSUserNotificationCenter.default.deliver(notification)
-                    }
                 }
             )
         }
