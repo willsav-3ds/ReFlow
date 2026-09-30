@@ -102,8 +102,6 @@ enum ShortcutAction: String, CaseIterable, Codable {
     case windowRightTwoThirds
     case displayPrevious
     case displayNext
-    case desktopPrevious
-    case desktopNext
     case toggleEmojiMode
     case trashTopResult
     case moveTopResult
@@ -112,9 +110,13 @@ enum ShortcutAction: String, CaseIterable, Codable {
 
     var scope: ShortcutScope {
         switch self {
-        case .toggleEmojiMode, .trashTopResult, .moveTopResult, .showInFinderTopResult, .openSettings:
+        case .trashTopResult, .moveTopResult, .showInFinderTopResult, .openSettings:
             return .launcher
         default:
+            // .toggleEmojiMode is global rather than launcher-scoped (unlike its
+            // siblings above): it needs to work — and take over the system's own
+            // Character Viewer shortcut — even when the launcher isn't already open,
+            // not just while browsing an already-open one.
             return .global
         }
     }
@@ -124,14 +126,15 @@ enum ShortcutAction: String, CaseIterable, Codable {
         case .toggleLauncher:
             return "General"
         case .windowLeftHalf, .windowRightHalf, .windowTopHalf, .windowBottomHalf,
-             .windowMaximize, .windowRestore,
-             .cornerTopLeft, .cornerTopRight, .cornerBottomLeft, .cornerBottomRight,
-             .windowLeftThird, .windowCenterThird, .windowRightThird,
-             .windowLeftTwoThirds, .windowRightTwoThirds,
-             .displayPrevious, .displayNext:
-            return "Window Management"
-        case .desktopPrevious, .desktopNext:
-            return "Desktops"
+             .windowMaximize, .windowRestore:
+            return "Halves & Maximize"
+        case .cornerTopLeft, .cornerTopRight, .cornerBottomLeft, .cornerBottomRight:
+            return "Corners"
+        case .windowLeftThird, .windowCenterThird, .windowRightThird,
+             .windowLeftTwoThirds, .windowRightTwoThirds:
+            return "Thirds"
+        case .displayPrevious, .displayNext:
+            return "Displays"
         case .toggleEmojiMode, .trashTopResult, .moveTopResult, .showInFinderTopResult, .openSettings:
             return "Launcher"
         }
@@ -157,8 +160,6 @@ enum ShortcutAction: String, CaseIterable, Codable {
         case .windowRightTwoThirds: return "Snap Window Right Two-Thirds"
         case .displayPrevious: return "Move Window to Previous Display"
         case .displayNext: return "Move Window to Next Display"
-        case .desktopPrevious: return "Previous Desktop"
-        case .desktopNext: return "Next Desktop"
         case .toggleEmojiMode: return "Toggle Emoji Search"
         case .trashTopResult: return "Move Top Result to Trash"
         case .moveTopResult: return "Move Top Result to…"
@@ -188,9 +189,6 @@ enum ShortcutAction: String, CaseIterable, Codable {
         case .windowRightTwoThirds: return KeyBinding(keyCode: 17, modifiers: [.control, .option]) // T
         case .displayPrevious: return KeyBinding(keyCode: 123, modifiers: [.control, .option, .command]) // Left
         case .displayNext: return KeyBinding(keyCode: 124, modifiers: [.control, .option, .command]) // Right
-        // Not part of Magnet's scheme; moved off ⌃⌥←/→ now that those are halves.
-        case .desktopPrevious: return KeyBinding(keyCode: 33, modifiers: [.control, .option, .command]) // [
-        case .desktopNext: return KeyBinding(keyCode: 30, modifiers: [.control, .option, .command]) // ]
         case .toggleEmojiMode: return KeyBinding(keyCode: 49, modifiers: [.control, .command]) // Space
         case .trashTopResult: return KeyBinding(keyCode: 51, modifiers: [.command]) // Delete
         case .moveTopResult: return KeyBinding(keyCode: 46, modifiers: [.command]) // M
@@ -298,6 +296,11 @@ final class HotKeyCenter {
     private var hotKeyRefs: [ShortcutAction: EventHotKeyRef] = [:]
     private var idToAction: [UInt32: ShortcutAction] = [:]
     private var eventHandler: EventHandlerRef?
+
+    /// How many global hotkeys are currently live with the OS — for the debug stats
+    /// window only. Can be less than the number of global-scope actions if any failed
+    /// to register (see the `print` in `registerAll` below).
+    var registeredCount: Int { hotKeyRefs.count }
 
     private static let signature: FourCharCode = {
         var result: FourCharCode = 0

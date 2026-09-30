@@ -13,6 +13,41 @@ struct ReFlowApp: App {
     }
 }
 
+/// Lets pure-AppKit code — like the status item's right-click menu below, which has no
+/// SwiftUI environment of its own — trigger the real `openSettings` environment action.
+/// `LauncherView` registers it (it's the one place in the app that already has it) as
+/// soon as its body first evaluates. Falls back to the private `showSettingsWindow:`
+/// selector (prints SwiftUI's own "use SettingsLink" warning, but still works) for the
+/// unlikely case this fires before that's happened even once.
+enum SettingsOpener {
+    static var openAction: (() -> Void)?
+
+    /// The actual Settings `NSWindow`, captured by `SettingsWindowAccessor` (in
+    /// SettingsView.swift) once SwiftUI creates it. Weak since we don't own it — the
+    /// `Settings` scene does, same as any other SwiftUI-managed window.
+    static weak var window: NSWindow?
+
+    static func open() {
+        // If Settings is already open — possibly on a different Space/desktop — just
+        // asking SwiftUI to "open" it again would only call `makeKeyAndOrderFront` on
+        // that same existing window, which reveals it wherever it already is by
+        // switching you (Mission-Control-style) to whatever desktop it was left open on,
+        // instead of bringing it to the one you're actually on. Closing it first means
+        // there's nothing left to "reveal" on the old Space, so whatever opens next —
+        // whether SwiftUI reuses this window or builds a fresh one — always lands on the
+        // current Space.
+        if let window, window.isVisible {
+            window.close()
+        }
+
+        if let openAction {
+            openAction()
+        } else {
+            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        }
+    }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusBarItem: NSStatusItem!
     var windowManager = WindowManager.shared
@@ -27,10 +62,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let icon = NSImage(named: "Image")
             icon?.size = NSSize(width: 18, height: 18)
             icon?.accessibilityDescription = "ReFlow"
+            // Template mode makes AppKit treat the icon as a monochrome stencil (using
+            // just its alpha channel) and tint it to match the menu bar's current
+            // appearance — light glyph on a dark menu bar, dark glyph on a light one,
+            // plus the dimmed/inverted look while the item is highlighted — the same way
+            // every other menu bar icon behaves. Also set on the image set itself
+            // ("Render As: Template Image"); setting it here too means this stays correct
+            // even if the image is ever loaded some other way.
+            icon?.isTemplate = true
             button.image = icon
-            button.action = #selector(toggleLauncher)
+            button.action = #selector(statusItemClicked)
             button.target = self
+            // Left-click still just toggles the launcher (the common case); right-click
+            // (or Control-click) instead shows a menu — both need to reach the same
+            // action method so it can tell which one happened.
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
+
+        // Warm up the launcher's SwiftUI content now, off-screen, so `SettingsOpener.openAction`
+        // (registered in `LauncherView.onAppear`) is ready before the user gets a chance to
+        // right-click the status item and choose Settings — without this, that path falls back
+        // to a private selector that no-ops on newer macOS instead of opening anything.
+        LauncherWindowController.shared.prepareContentOffscreen()
 
         // Set up global hotkeys, driven by the user's customizable bindings
         HotKeyCenter.shared.handler = { [weak self] action in
@@ -80,11 +133,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             windowManager.moveActiveWindowToPreviousDisplay()
         case .displayNext:
             windowManager.moveActiveWindowToNextDisplay()
-        case .desktopPrevious:
-            windowManager.moveToPreviousDesktop()
-        case .desktopNext:
-            windowManager.moveToNextDesktop()
-        case .toggleEmojiMode, .trashTopResult, .moveTopResult, .showInFinderTopResult, .openSettings:
+        case .toggleEmojiMode:
+            LauncherWindowController.shared.showEmojiPicker()
+        case .trashTopResult, .moveTopResult, .showInFinderTopResult, .openSettings:
             // Launcher-scope actions are handled locally by LauncherView while it's focused.
             break
         }
@@ -92,6 +143,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func toggleLauncher() {
         LauncherWindowController.shared.toggle()
+    }
+
+    @objc func statusItemClicked() {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            showStatusMenu()
+        } else {
+            toggleLauncher()
+        }
+    }
+
+    /// Shown via the standard "assign a menu, synthesize a click, clear it again" trick
+    /// — assigning `statusBarItem.menu` directly (instead of just for this one moment)
+    /// would make it pop up on *every* click, left or right alike, which isn't what we
+    /// want here.
+    private func showStatusMenu() {
+        let menu = NSMenu()
+
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettingsFromMenu), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
+        let debugStatsItem = NSMenuItem(title: "Debug Stats…", action: #selector(openDebugStatsFromMenu), keyEquivalent: "")
+        debugStatsItem.target = self
+        menu.addItem(debugStatsItem)
+
+        menu.addItem(.separator())
+
+        // A nil target lets this reach `NSApplication.terminate(_:)` via the normal
+        // responder chain, the same way a standard File > Quit menu item works.
+        menu.addItem(NSMenuItem(title: "Quit ReFlow", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+
+        statusBarItem.menu = menu
+        statusBarItem.button?.performClick(nil)
+        statusBarItem.menu = nil
+    }
+
+    @objc func openDebugStatsFromMenu() {
+        DebugStatsWindowController.shared.show()
+    }
+
+    @objc func openSettingsFromMenu() {
+        SettingsOpener.open()
     }
 
     func requestAccessibilityPermissions() {
@@ -119,6 +212,13 @@ final class LauncherWindowController: NSObject, ObservableObject, NSWindowDelega
     /// SwiftUI's `.onAppear` won't refire on every reopen. LauncherView observes this
     /// instead so it can refocus and reset itself every time the window becomes visible.
     @Published private(set) var isVisible = false
+
+    /// Whichever app was active right before the panel opened — captured fresh on every
+    /// open since our nonactivating panel never steals "active application" status from
+    /// it. Selecting an emoji or sticker pastes back into this app (see `ClipboardPaste`),
+    /// since there's no public API to insert text/images into another app's focused field
+    /// directly.
+    private(set) var appToRestoreFocusTo: NSRunningApplication?
 
     private let panel: LauncherPanel
     private static let originDefaultsKey = "launcherWindowOrigin_v2"
@@ -158,6 +258,23 @@ final class LauncherWindowController: NSObject, ObservableObject, NSWindowDelega
         }
     }
 
+    /// Briefly orders the panel on-screen far off any real display, then off again, purely so
+    /// `LauncherView`'s `.onAppear` runs and captures the real `openSettings` environment action
+    /// into `SettingsOpener.openAction` — without ever flashing the launcher where the user would
+    /// actually see it. Guarded with `isProgrammaticMove` so this synthetic position never gets
+    /// persisted as the user's saved launcher origin, and deferred a beat before hiding again so
+    /// SwiftUI has a run loop turn to actually deliver `onAppear` before we order out.
+    func prepareContentOffscreen() {
+        configureContentIfNeeded()
+        isProgrammaticMove = true
+        panel.setFrameOrigin(NSPoint(x: -20000, y: -20000))
+        isProgrammaticMove = false
+        panel.orderFrontRegardless()
+        DispatchQueue.main.async { [weak self] in
+            self?.panel.orderOut(nil)
+        }
+    }
+
     private var contentConfigured = false
 
     /// Deferred until after `init()` returns and `.shared` is fully assigned. `LauncherView`
@@ -176,6 +293,7 @@ final class LauncherWindowController: NSObject, ObservableObject, NSWindowDelega
     }
 
     func show() {
+        appToRestoreFocusTo = NSWorkspace.shared.frontmostApplication
         configureContentIfNeeded()
         isProgrammaticMove = true
         panel.setFrameOrigin(savedOrigin() ?? defaultOrigin())
@@ -194,6 +312,20 @@ final class LauncherWindowController: NSObject, ObservableObject, NSWindowDelega
     func hide() {
         panel.orderOut(nil)
         isVisible = false
+    }
+
+    /// Opens directly into emoji/sticker search — or, if already open, just flips between
+    /// emoji and launcher mode in place, same as the toolbar toggle button. Used by the
+    /// global ⌃⌘Space hotkey so it behaves the same whether or not the launcher is
+    /// already open, in place of macOS's own (much slower) Character Viewer on that same
+    /// shortcut.
+    func showEmojiPicker() {
+        if isVisible {
+            SearchEngine.shared.toggleMode()
+        } else {
+            SearchEngine.shared.searchMode = .emoji
+            show()
+        }
     }
 
     private func defaultOrigin() -> NSPoint {

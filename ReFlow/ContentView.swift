@@ -2,7 +2,7 @@ import SwiftUI
 import AppKit
 
 struct LauncherView: View {
-    @StateObject private var searchEngine = SearchEngine()
+    @ObservedObject private var searchEngine = SearchEngine.shared
     @ObservedObject private var shortcuts = ShortcutStore.shared
     @ObservedObject private var windowController = LauncherWindowController.shared
     @State private var searchText = ""
@@ -11,6 +11,7 @@ struct LauncherView: View {
     @State private var fileToManage: URL?
     @State private var launcherKeyMonitor: Any?
     @FocusState private var isSearchFieldFocused: Bool
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,8 +25,15 @@ struct LauncherView: View {
                     .font(.system(size: 22, weight: .light))
                     .focused($isSearchFieldFocused)
                     .onSubmit {
-                        if let firstResult = searchEngine.results.first {
-                            execute(firstResult)
+                        // `results` may still reflect the *previous* query: typing debounces
+                        // for a beat before a search actually runs, and Enter can land inside
+                        // that window. Wait for whatever's in flight so we act on results for
+                        // what's actually in the field, not whatever was there a moment ago.
+                        Task {
+                            await searchEngine.waitForPendingSearch()
+                            if let firstResult = searchEngine.results.first {
+                                execute(firstResult)
+                            }
                         }
                     }
 
@@ -48,7 +56,7 @@ struct LauncherView: View {
                       : "Switch to emoji search (\(shortcuts.binding(for: .toggleEmojiMode).displayString))")
 
                 // Settings
-                Button(action: openSettings) {
+                Button(action: { closeWindow(); SettingsOpener.open() }) {
                     Image(systemName: "gearshape")
                         .foregroundStyle(.secondary)
                 }
@@ -116,6 +124,14 @@ struct LauncherView: View {
         }
         .onAppear {
             installLauncherKeyMonitor()
+            // Registers the real `openSettings` environment action for `SettingsOpener`
+            // to use — this view is the one place in the app that already has it, so
+            // AppKit-only code with no SwiftUI environment of its own (like the status
+            // item's right-click menu) can still reach it.
+            SettingsOpener.openAction = {
+                closeWindow()
+                openSettings()
+            }
         }
         .onDisappear {
             removeLauncherKeyMonitor()
@@ -171,29 +187,43 @@ struct LauncherView: View {
 
     private func handleLauncherAction(_ action: ShortcutAction) {
         switch action {
-        case .toggleEmojiMode:
-            searchEngine.toggleMode()
         case .trashTopResult:
-            guard let fileURL = searchEngine.results.first?.fileURL else { return }
-            FileOps.trash(fileURL)
-            searchEngine.search(query: searchText)
-        case .moveTopResult:
-            guard let fileURL = searchEngine.results.first?.fileURL else { return }
-            FileOps.moveWithPicker(fileURL) {
+            // Same stale-results race as `onSubmit` below — wait for any in-flight search
+            // before trusting `results.first`.
+            Task {
+                await searchEngine.waitForPendingSearch()
+                guard let fileURL = searchEngine.results.first?.fileURL else { return }
+                FileOps.trash(fileURL)
                 searchEngine.search(query: searchText)
             }
+        case .moveTopResult:
+            Task {
+                await searchEngine.waitForPendingSearch()
+                guard let fileURL = searchEngine.results.first?.fileURL else { return }
+                FileOps.moveWithPicker(fileURL) {
+                    searchEngine.search(query: searchText)
+                }
+            }
         case .showInFinderTopResult:
-            guard let fileURL = searchEngine.results.first?.fileURL else { return }
-            FileOps.showInFinder(fileURL)
+            Task {
+                await searchEngine.waitForPendingSearch()
+                guard let fileURL = searchEngine.results.first?.fileURL else { return }
+                FileOps.showInFinder(fileURL)
+            }
         case .openSettings:
-            openSettings()
+            // The launcher panel floats above normal windows (so it stays visible while
+            // tiling apps etc.), which meant Settings — an ordinary window — was opening
+            // *behind* it: pressing ⌘, while the launcher was up looked like nothing
+            // happened, when Settings had actually opened, just hidden from view. Close
+            // the launcher first so Settings actually ends up on top. Going through
+            // `SettingsOpener.open()` (rather than calling `openSettings()` directly) is
+            // what makes an already-open Settings window get closed and reopened on the
+            // current desktop instead of just revealed wherever it was left.
+            closeWindow()
+            SettingsOpener.open()
         default:
             break
         }
-    }
-
-    private func openSettings() {
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
     }
 
     private func closeWindow() {
@@ -205,7 +235,11 @@ struct LauncherView: View {
     /// open since nothing was actually launched; everything else closes the window after.
     private func execute(_ result: SearchResult) {
         result.execute()
-        if result.type != .command {
+        if result.type == .command {
+            // A command result switches modes rather than launching anything — clear the
+            // field so it doesn't keep showing e.g. "fs" once we're in the new mode.
+            searchText = ""
+        } else {
             closeWindow()
         }
     }
@@ -215,14 +249,16 @@ struct LauncherView: View {
         case .emoji: return "face.smiling"
         case .fileSearch: return "folder"
         case .launcher: return "magnifyingglass"
+        case .clipboardHistory: return "doc.on.clipboard"
         }
     }
 
     private var searchBarPlaceholder: String {
         switch searchEngine.searchMode {
-        case .emoji: return "Search emoji..."
+        case .emoji: return "Search emoji and stickers..."
         case .fileSearch: return "Search files or enter a path..."
         case .launcher: return "Search apps, scripts, or type fs for File Search..."
+        case .clipboardHistory: return "Search clipboard history..."
         }
     }
 }

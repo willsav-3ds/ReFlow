@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import Combine
 
 /// A user-defined shortcut to a file, folder, or URL, searchable by name from the launcher.
 struct QuickLink: Codable, Identifiable, Equatable {

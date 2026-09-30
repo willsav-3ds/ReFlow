@@ -36,7 +36,9 @@ final class ClipboardHistoryStore: ObservableObject {
 
     private static let enabledDefaultsKey = "clipboardHistoryEnabled"
     private static let maxEntries = 50
-    private static let pollInterval: TimeInterval = 0.75
+    /// Not `private`: the debug stats window reports this alongside whether monitoring
+    /// is currently on, so it's visible without duplicating the number there.
+    static let pollInterval: TimeInterval = 0.75
 
     private var timer: Timer?
     private var lastChangeCount: Int

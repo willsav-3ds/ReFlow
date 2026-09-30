@@ -45,7 +45,10 @@ enum ResultType {
     case command
     case windowAction
     case emoji
+    case sticker
     case quickLink
+    case clipboardHistory
+    case calculator
 
     var displayName: String {
         switch self {
@@ -55,7 +58,10 @@ enum ResultType {
         case .command: return "Command"
         case .windowAction: return "Window"
         case .emoji: return "Emoji"
+        case .sticker: return "Sticker"
         case .quickLink: return "Quick Link"
+        case .clipboardHistory: return "Clipboard"
+        case .calculator: return "Calculator"
         }
     }
 }
