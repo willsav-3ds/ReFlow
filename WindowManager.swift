@@ -8,6 +8,16 @@ class WindowManager {
         case topLeft, topRight, bottomLeft, bottomRight
     }
 
+    /// Whatever a tiling command acts on. Almost always another app's window, reached via
+    /// Accessibility — but a few of ReFlow's own ordinary windows (Camera) should tile like
+    /// any other window too. Those are moved directly through AppKit instead: AX calls into
+    /// our *own* process from the main thread would have to be serviced by that same,
+    /// currently-blocked main thread, so they stall until they time out.
+    enum TileTarget {
+        case accessibility(AXUIElement)
+        case own(NSWindow)
+    }
+
     private init() {}
 
     // MARK: - Window Positioning
@@ -24,7 +34,7 @@ class WindowManager {
             height: screenFrame.height
         )
 
-        setWindowFrame(window, frame: newFrame)
+        setWindowFrame(window, frame: newFrame, within: screen.visibleFrame)
     }
 
     func moveActiveWindowToRightHalf() {
@@ -39,7 +49,7 @@ class WindowManager {
             height: screenFrame.height
         )
 
-        setWindowFrame(window, frame: newFrame)
+        setWindowFrame(window, frame: newFrame, within: screen.visibleFrame)
     }
 
     func moveActiveWindowToBottomHalf() {
@@ -54,7 +64,7 @@ class WindowManager {
             height: screenFrame.height / 2
         )
 
-        setWindowFrame(window, frame: newFrame)
+        setWindowFrame(window, frame: newFrame, within: screen.visibleFrame)
     }
 
     func moveActiveWindowToTopHalf() {
@@ -69,7 +79,7 @@ class WindowManager {
             height: screenFrame.height / 2
         )
 
-        setWindowFrame(window, frame: newFrame)
+        setWindowFrame(window, frame: newFrame, within: screen.visibleFrame)
     }
 
     func moveActiveWindowToCorner(_ corner: Corner) {
@@ -112,7 +122,7 @@ class WindowManager {
             )
         }
 
-        setWindowFrame(window, frame: newFrame)
+        setWindowFrame(window, frame: newFrame, within: screen.visibleFrame)
     }
 
     func maximizeActiveWindow() {
@@ -120,7 +130,7 @@ class WindowManager {
         guard let screen = screenForWindow(window) else { return }
 
         let screenFrame = screen.visibleFrame
-        setWindowFrame(window, frame: screenFrame)
+        setWindowFrame(window, frame: screenFrame, within: screenFrame)
     }
 
     func centerActiveWindow() {
@@ -138,7 +148,7 @@ class WindowManager {
             height: height
         )
 
-        setWindowFrame(window, frame: newFrame)
+        setWindowFrame(window, frame: newFrame, within: screen.visibleFrame)
     }
 
     // MARK: - Thirds
@@ -156,7 +166,7 @@ class WindowManager {
             height: screenFrame.height
         )
 
-        setWindowFrame(window, frame: newFrame)
+        setWindowFrame(window, frame: newFrame, within: screen.visibleFrame)
     }
 
     func moveActiveWindowToCenterThird() {
@@ -172,7 +182,7 @@ class WindowManager {
             height: screenFrame.height
         )
 
-        setWindowFrame(window, frame: newFrame)
+        setWindowFrame(window, frame: newFrame, within: screen.visibleFrame)
     }
 
     func moveActiveWindowToRightThird() {
@@ -188,7 +198,7 @@ class WindowManager {
             height: screenFrame.height
         )
 
-        setWindowFrame(window, frame: newFrame)
+        setWindowFrame(window, frame: newFrame, within: screen.visibleFrame)
     }
 
     func moveActiveWindowToLeftTwoThirds() {
@@ -204,7 +214,7 @@ class WindowManager {
             height: screenFrame.height
         )
 
-        setWindowFrame(window, frame: newFrame)
+        setWindowFrame(window, frame: newFrame, within: screen.visibleFrame)
     }
 
     func moveActiveWindowToRightTwoThirds() {
@@ -221,7 +231,7 @@ class WindowManager {
             height: screenFrame.height
         )
 
-        setWindowFrame(window, frame: newFrame)
+        setWindowFrame(window, frame: newFrame, within: screen.visibleFrame)
     }
 
     // MARK: - Multi-Display
@@ -236,11 +246,9 @@ class WindowManager {
 
     private func moveActiveWindowToAdjacentDisplay(offset: Int) {
         guard let window = getFrontmostWindow() else { return }
-        guard let axFrame = getWindowFrame(window) else { return }
         // Everything below (screen containment checks, relative-offset math) is done in
-        // NSScreen's coordinate space, so the AX-space frame we just read needs converting
-        // first — see the note on `screenSpaceFrame(fromAX:)`.
-        let currentFrame = screenSpaceFrame(fromAX: axFrame)
+        // NSScreen's coordinate space — see the note on `screenSpaceFrame(fromAX:)`.
+        guard let currentFrame = currentScreenSpaceFrame(of: window) else { return }
 
         let screens = NSScreen.screens
         guard screens.count > 1 else { return }
@@ -262,12 +270,12 @@ class WindowManager {
             height: currentFrame.height
         )
 
-        setWindowFrame(window, frame: newFrame)
+        setWindowFrame(window, frame: newFrame, within: targetScreen.visibleFrame)
     }
 
     // MARK: - Helper Methods
 
-    private func getFrontmostWindow() -> AXUIElement? {
+    private func getFrontmostWindow() -> TileTarget? {
         if !AXIsProcessTrusted() {
             print("ReFlow[tiling]: Accessibility permission not granted — cannot read/move any window.")
             return nil
@@ -307,10 +315,15 @@ class WindowManager {
         let havePid = AXUIElementGetPid(appRef, &pid) == .success
         let appName = (havePid ? NSRunningApplication(processIdentifier: pid)?.localizedName : nil) ?? "?"
 
-        // Never tile our own windows (e.g. Settings) — otherwise a global tiling hotkey
-        // pressed while Settings is focused (such as while recording that very shortcut)
-        // would grab and move Settings itself instead of doing nothing.
-        guard !havePid || pid != ProcessInfo.processInfo.processIdentifier else {
+        // Never tile most of our own windows (e.g. Settings) — otherwise a global tiling
+        // hotkey pressed while Settings is focused (such as while recording that very
+        // shortcut) would grab and move Settings itself instead of doing nothing. The
+        // Camera window is the exception: it's an ordinary content window people expect
+        // to snap around like any other.
+        if havePid && pid == ProcessInfo.processInfo.processIdentifier {
+            if let keyWindow = NSApp.keyWindow, CameraWindowController.shared.owns(keyWindow) {
+                return .own(keyWindow)
+            }
             print("ReFlow[tiling]: frontmost app is ReFlow itself — refusing to tile our own window.")
             return nil
         }
@@ -319,7 +332,7 @@ class WindowManager {
         let result = AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &window)
 
         if result == .success, let windowRef = window {
-            return (windowRef as! AXUIElement)
+            return .accessibility(windowRef as! AXUIElement)
         }
 
         print("ReFlow[tiling]: could not get focused window of \(appName) via AXFocusedWindow, AXError=\(result.rawValue) — falling back to AXWindows.")
@@ -341,10 +354,10 @@ class WindowManager {
             guard AXUIElementCopyAttributeValue(candidate, kAXMainAttribute as CFString, &isMainValue) == .success else { return false }
             return (isMainValue as? Bool) == true
         }) {
-            return mainWindow
+            return .accessibility(mainWindow)
         }
 
-        return windows.first
+        return .accessibility(windows[0])
     }
 
     /// The screen that actually contains `window`, rather than `NSScreen.main` (which tracks
@@ -354,14 +367,11 @@ class WindowManager {
     /// setup where the target window isn't on the primary screen, which is what open-source
     /// tiling tools (e.g. Rectangle, Amethyst) resolve by locating the screen from the window's
     /// own frame — mirrored below and already done correctly for `moveActiveWindowToAdjacentDisplay`.
-    private func screenForWindow(_ window: AXUIElement) -> NSScreen? {
-        guard let axFrame = getWindowFrame(window) else {
+    private func screenForWindow(_ window: TileTarget) -> NSScreen? {
+        guard let frame = currentScreenSpaceFrame(of: window) else {
             print("ReFlow[tiling]: could not read window frame to resolve its screen — falling back to NSScreen.main.")
             return NSScreen.main
         }
-        // NSScreen frames live in AppKit's coordinate space, not the AX frame we just read —
-        // see the note on `screenSpaceFrame(fromAX:)`.
-        let frame = screenSpaceFrame(fromAX: axFrame)
 
         let center = CGPoint(x: frame.midX, y: frame.midY)
         if let screen = NSScreen.screens.first(where: { $0.frame.contains(center) }) {
@@ -374,6 +384,16 @@ class WindowManager {
             lhs.frame.intersection(frame).width * lhs.frame.intersection(frame).height
                 < rhs.frame.intersection(frame).width * rhs.frame.intersection(frame).height
         } ?? NSScreen.main
+    }
+
+    /// The target's current frame in NSScreen's coordinate space, however it's reached.
+    private func currentScreenSpaceFrame(of target: TileTarget) -> CGRect? {
+        switch target {
+        case .accessibility(let window):
+            return getWindowFrame(window).map(screenSpaceFrame(fromAX:))
+        case .own(let window):
+            return window.frame
+        }
     }
 
     /// Returns the window's frame in the Accessibility API's own coordinate space: origin at
@@ -447,19 +467,74 @@ class WindowManager {
     private var pendingWindowFrameWork: DispatchWorkItem?
     private static let tileDebounceInterval: TimeInterval = 0.05
 
-    private func setWindowFrame(_ window: AXUIElement, frame screenSpaceFrame: CGRect) {
+    /// `bounds` is the screen-space area the window must stay inside (the target screen's
+    /// `visibleFrame`, i.e. clear of the menu bar and Dock) if it turns out it can't take
+    /// `frame`'s exact size — see `fittedFrame(size:target:bounds:)`.
+    private func setWindowFrame(_ window: TileTarget, frame screenSpaceFrame: CGRect, within bounds: CGRect) {
         // Coalesce to only the most recently requested frame: cancel anything still
         // pending so a fast burst of presses resolves to a single, clean apply of the
         // last one, instead of every intermediate press racing to actually take effect.
         pendingWindowFrameWork?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
-            self?.applyWindowFrame(window, frame: screenSpaceFrame)
+            switch window {
+            case .accessibility(let axWindow):
+                self?.applyWindowFrame(axWindow, frame: screenSpaceFrame, within: bounds)
+            case .own(let nsWindow):
+                self?.applyOwnWindowFrame(nsWindow, frame: screenSpaceFrame, within: bounds)
+            }
         }
         pendingWindowFrameWork = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.tileDebounceInterval, execute: workItem)
     }
 
-    private func applyWindowFrame(_ window: AXUIElement, frame screenSpaceFrame: CGRect) {
+    private func applyOwnWindowFrame(_ window: NSWindow, frame screenSpaceFrame: CGRect, within bounds: CGRect) {
+        // `setFrame` doesn't enforce the window's own minimum size the way a user drag
+        // does, so apply it here — then place that size exactly like an AX window that
+        // refused to shrink.
+        let minFrame = window.frameRect(forContentRect: NSRect(origin: .zero, size: window.contentMinSize))
+        let size = CGSize(
+            width: max(screenSpaceFrame.width, window.minSize.width, minFrame.width),
+            height: max(screenSpaceFrame.height, window.minSize.height, minFrame.height)
+        )
+        window.setFrame(fittedFrame(size: size, target: screenSpaceFrame, bounds: bounds), display: true)
+    }
+
+    /// Where a window of `size` should go when it was asked to fill `target` but couldn't
+    /// take that exact size (a minimum size, like Music's, or a fixed-size window): keep it
+    /// as close to the requested tile as possible, but never let it hang off the screen or
+    /// under the Dock — staying fully visible wins over matching the tile exactly.
+    ///
+    /// Per axis, the window keeps whichever edge of the tile sits on a screen edge (a left
+    /// third stays flush left, a bottom-right corner stays flush right and bottom), or is
+    /// centered on the tile when the tile touches neither (the center third). The result
+    /// is then clamped into `bounds`; if the window is bigger than `bounds` outright, it's
+    /// pinned to the left and *top* so its title bar stays reachable.
+    private func fittedFrame(size: CGSize, target: CGRect, bounds: CGRect) -> CGRect {
+        func place(length: CGFloat, targetMin: CGFloat, targetMax: CGFloat, boundsMin: CGFloat, boundsMax: CGFloat, oversizedAtMax: Bool) -> CGFloat {
+            let tolerance: CGFloat = 2
+            let touchesMin = abs(targetMin - boundsMin) <= tolerance
+            let touchesMax = abs(targetMax - boundsMax) <= tolerance
+            if length >= boundsMax - boundsMin {
+                return oversizedAtMax ? boundsMax - length : boundsMin
+            }
+            let origin: CGFloat
+            if touchesMax && !touchesMin {
+                origin = targetMax - length
+            } else if touchesMin {
+                origin = targetMin
+            } else {
+                origin = targetMin + (targetMax - targetMin - length) / 2
+            }
+            return min(max(origin, boundsMin), boundsMax - length)
+        }
+
+        // Screen space has Y increasing upward, so "top" is the max edge.
+        let x = place(length: size.width, targetMin: target.minX, targetMax: target.maxX, boundsMin: bounds.minX, boundsMax: bounds.maxX, oversizedAtMax: false)
+        let y = place(length: size.height, targetMin: target.minY, targetMax: target.maxY, boundsMin: bounds.minY, boundsMax: bounds.maxY, oversizedAtMax: true)
+        return CGRect(x: x, y: y, width: size.width, height: size.height)
+    }
+
+    private func applyWindowFrame(_ window: AXUIElement, frame screenSpaceFrame: CGRect, within bounds: CGRect) {
         // A window in native full-screen (or one that just doesn't expose a resizable AX
         // frame, e.g. some utility panels) can't be repositioned via AX at all — Rectangle
         // and Amethyst both special-case this rather than issuing a set that will silently
@@ -522,7 +597,22 @@ class WindowManager {
         }
 
         let (phase1Position, phase1Size) = writeAndVerify(target: sizeSettledFrame, to: window, setPosition: true, setSize: true)
-        let (phase2Position, _) = writeAndVerify(target: targetFrame, to: window, setPosition: true, setSize: false)
+        var (phase2Position, _) = writeAndVerify(target: targetFrame, to: window, setPosition: true, setSize: false)
+
+        // Some windows simply can't take the requested size — Music and other apps with a
+        // minimum size, or fixed-size utility windows — and positioning those at the tile's
+        // exact origin anyway is what pushed them off the side of the screen or down
+        // behind the Dock. Whatever frame the window actually ended up with, re-place it
+        // so it's fully inside the visible area while sitting as close to the requested
+        // tile as it can. For a window that did take the exact size this is a no-op: its
+        // fitted frame *is* the target.
+        if let landed = getWindowFrame(window) {
+            let fitted = axFrame(fromScreenSpace: fittedFrame(size: landed.size, target: screenSpaceFrame, bounds: bounds))
+            if !framesMatch(landed, fitted) {
+                print("ReFlow[tiling]: window landed at \(landed) instead of \(targetFrame) — re-placing it at \(fitted.origin) to keep it fully visible.")
+                phase2Position = writeAndVerify(target: fitted, to: window, setPosition: true, setSize: false).positionResult
+            }
+        }
 
         if let wasEnhancedUIEnabled, wasEnhancedUIEnabled {
             _ = setEnhancedUserInterface(for: window, enabled: true)

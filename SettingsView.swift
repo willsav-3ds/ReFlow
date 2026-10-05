@@ -52,6 +52,9 @@ private struct SettingsWindowAccessor: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSView, context: Context) {
         DispatchQueue.main.async {
+            // `.moveToActiveSpace` makes activating Settings bring it to whichever desktop
+            // you're on, rather than switching you to the one it was left open on.
+            nsView.window?.collectionBehavior.insert(.moveToActiveSpace)
             SettingsOpener.window = nsView.window
         }
     }

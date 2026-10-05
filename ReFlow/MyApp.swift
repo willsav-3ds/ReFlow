@@ -40,10 +40,32 @@ enum SettingsOpener {
             window.close()
         }
 
+        // ReFlow is a menu-bar (LSUIElement) app that's usually *not* the active app —
+        // SwiftUI's `openSettings` doesn't activate it, so Settings would open behind
+        // whatever you were using instead of becoming the focused window.
+        NSApp.activate(ignoringOtherApps: true)
+
         if let openAction {
             openAction()
         } else {
             NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        }
+
+        focusWhenShown()
+    }
+
+    /// SwiftUI creates/shows the window asynchronously (and `SettingsWindowAccessor` only
+    /// captures it a run loop turn after that), so poll briefly for it to appear, then
+    /// pull it onto the current Space and make it key.
+    private static func focusWhenShown(attemptsLeft: Int = 20) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.025) {
+            guard let window, window.isVisible else {
+                if attemptsLeft > 0 { focusWhenShown(attemptsLeft: attemptsLeft - 1) }
+                return
+            }
+            window.collectionBehavior.insert(.moveToActiveSpace)
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
         }
     }
 }

@@ -18,17 +18,29 @@ final class CameraWindowController: NSObject, NSWindowDelegate {
             window.makeKeyAndOrderFront(nil)
         } else {
             let hosting = NSHostingController(rootView: CameraView(capture: capture))
+            // Only let SwiftUI dictate a *minimum* size — otherwise the hosting controller
+            // pins the window to the view's ideal size and it can't be resized or tiled.
+            hosting.sizingOptions = [.minSize]
             let newWindow = NSWindow(contentViewController: hosting)
             newWindow.title = "Camera"
-            newWindow.styleMask = [.titled, .closable, .miniaturizable]
+            // Resizable so window-tiling commands (see `WindowManager.TileTarget.own`) can
+            // actually snap it into halves/thirds/corners like any other window.
+            newWindow.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             newWindow.isReleasedWhenClosed = false
             newWindow.delegate = self
+            newWindow.setContentSize(CameraView.defaultSize)
             newWindow.center()
             window = newWindow
             newWindow.makeKeyAndOrderFront(nil)
         }
         NSApp.activate(ignoringOtherApps: true)
         capture.start()
+    }
+
+    /// Lets `WindowManager` tell the Camera window apart from ReFlow's other windows
+    /// (Settings, the launcher), which tiling commands deliberately leave alone.
+    func owns(_ candidate: NSWindow) -> Bool {
+        candidate === window
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -146,6 +158,8 @@ extension CameraCaptureController: AVCaptureVideoDataOutputSampleBufferDelegate 
 /// Return saves it to the Desktop as a PNG — both act on the exact same mirrored frame
 /// `CameraCaptureController` is already displaying, so what you see is what you get.
 struct CameraView: View {
+    static let defaultSize = NSSize(width: 480, height: 360)
+
     @ObservedObject var capture: CameraCaptureController
     @FocusState private var isFocused: Bool
     @State private var feedback: String?
@@ -165,10 +179,14 @@ struct CameraView: View {
                     detail: "Connect or enable a camera and reopen this window."
                 )
             } else if let image = capture.previewImage {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .frame(width: 480, height: 360)
+                // Overlaid on a flexible Color so the window's size — not the image's —
+                // drives layout; the image then fills whatever shape the window is tiled to.
+                Color.clear
+                    .overlay {
+                        Image(nsImage: image)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                    }
                     .clipped()
             } else {
                 ProgressView("Starting camera…")
@@ -187,7 +205,7 @@ struct CameraView: View {
                     .transition(.opacity)
             }
         }
-        .frame(width: 480, height: 360)
+        .frame(minWidth: 240, maxWidth: .infinity, minHeight: 180, maxHeight: .infinity)
         .focusable()
         .focused($isFocused)
         .onAppear { isFocused = true }
