@@ -250,24 +250,40 @@ class WindowManager {
         // NSScreen's coordinate space — see the note on `screenSpaceFrame(fromAX:)`.
         guard let currentFrame = currentScreenSpaceFrame(of: window) else { return }
 
-        let screens = NSScreen.screens
-        guard screens.count > 1 else { return }
+        // `NSScreen.screens` is ordered primary-first, then however the system happens
+        // to list the rest — not by where the displays physically sit. Sort them into
+        // their arrangement (left to right, then bottom to top) so "previous" and "next"
+        // actually mean the display to the left and right.
+        let screens = NSScreen.screens.sorted {
+            $0.frame.minX != $1.frame.minX ? $0.frame.minX < $1.frame.minX : $0.frame.minY < $1.frame.minY
+        }
+        guard screens.count > 1 else {
+            print("ReFlow[tiling]: only one display connected — nothing to move the window to.")
+            return
+        }
 
-        let windowCenter = CGPoint(x: currentFrame.midX, y: currentFrame.midY)
-        guard let currentIndex = screens.firstIndex(where: { $0.frame.contains(windowCenter) }) else { return }
+        // Same screen resolution as every other tiling command. Requiring the window's
+        // exact center to be on a screen (as this used to) silently did nothing for a
+        // window hanging partly off its display.
+        guard let currentScreen = screenForWindow(window),
+              let currentIndex = screens.firstIndex(of: currentScreen) else { return }
 
         let targetIndex = (currentIndex + offset + screens.count) % screens.count
-        let currentScreen = screens[currentIndex]
         let targetScreen = screens[targetIndex]
 
-        // Preserve the window's position relative to its current screen's visible frame.
+        // Preserve the window's position relative to its current screen's visible frame,
+        // but shrink and shift it to fit if the target display is smaller — otherwise a
+        // window that lands exactly where asked would hang off the edge of it.
+        let bounds = targetScreen.visibleFrame
+        let width = min(currentFrame.width, bounds.width)
+        let height = min(currentFrame.height, bounds.height)
         let relativeX = currentFrame.minX - currentScreen.visibleFrame.minX
         let relativeY = currentFrame.minY - currentScreen.visibleFrame.minY
         let newFrame = CGRect(
-            x: targetScreen.visibleFrame.minX + relativeX,
-            y: targetScreen.visibleFrame.minY + relativeY,
-            width: currentFrame.width,
-            height: currentFrame.height
+            x: min(max(bounds.minX + relativeX, bounds.minX), bounds.maxX - width),
+            y: min(max(bounds.minY + relativeY, bounds.minY), bounds.maxY - height),
+            width: width,
+            height: height
         )
 
         setWindowFrame(window, frame: newFrame, within: targetScreen.visibleFrame)
@@ -558,6 +574,23 @@ class WindowManager {
         // still reports `.success`, the window just never actually moves. Toggling it off for
         // the duration of the set, then restoring it, is what real tiling apps do about it.
         let wasEnhancedUIEnabled = setEnhancedUserInterface(for: window, enabled: false)
+        defer {
+            if let wasEnhancedUIEnabled, wasEnhancedUIEnabled {
+                _ = setEnhancedUserInterface(for: window, enabled: true)
+            }
+        }
+
+        // Fast path: one size → position → size write (the order Rectangle uses — the
+        // trailing size re-applies whatever an app clamped while the window was still at
+        // its old position), checked once. Most apps take it exactly, so the window moves
+        // straight to its tile in a single visible step. Going through the two-phase write
+        // below every time is what made windows visibly jump around: phase 1 shows the new
+        // size at the *old* vertical position, phase 2 then slides it into place, and
+        // each read-back retry can nudge it again. That path is still there for whatever
+        // doesn't land here — Safari's stale-value reconciliation, minimum-size windows.
+        if writeDirectly(targetFrame, to: window) {
+            return
+        }
 
         // Safari's AX bridge doesn't reliably apply a position and a size sent as two
         // separate calls in the order we actually sent them — it can reconcile them using
@@ -614,13 +647,27 @@ class WindowManager {
             }
         }
 
-        if let wasEnhancedUIEnabled, wasEnhancedUIEnabled {
-            _ = setEnhancedUserInterface(for: window, enabled: true)
-        }
-
         if phase1Position != .success || phase1Size != .success || phase2Position != .success {
             print("ReFlow[tiling]: setWindowFrame failed (phase1PositionAXError=\(phase1Position.rawValue), phase1SizeAXError=\(phase1Size.rawValue), phase2PositionAXError=\(phase2Position.rawValue)).")
         }
+    }
+
+    /// The single-step write behind `applyWindowFrame`'s fast path. Returns whether the
+    /// window actually ended up at `target`, without retrying — a miss falls through to
+    /// the two-phase write instead.
+    private func writeDirectly(_ target: CGRect, to window: AXUIElement) -> Bool {
+        var position = target.origin
+        var size = target.size
+        let positionValue = AXValueCreate(.cgPoint, &position)!
+        let sizeValue = AXValueCreate(.cgSize, &size)!
+
+        AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, sizeValue)
+        AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, positionValue)
+        AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, sizeValue)
+
+        // Same settle time as `writeAndVerify`, for the same Safari IPC reason.
+        Thread.sleep(forTimeInterval: 0.02)
+        return getWindowFrame(window).map { framesMatch($0, target) } ?? false
     }
 
     /// Writes `target` to `window`, touching only the AX attributes the caller asks for —

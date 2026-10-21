@@ -20,14 +20,37 @@ class SearchEngine: ObservableObject {
 
     @Published var results: [SearchResult] = []
     @Published var searchMode: SearchMode = .launcher
+    /// Which row of `results` the arrow keys have moved to — what Enter and the
+    /// selected-result shortcuts (Trash / Move to… / Show in Finder) act on. Lives here
+    /// rather than in `LauncherView` so it resets in the same step as `results` itself:
+    /// anything that waits out a pending search (see `waitForPendingSearch`) and then
+    /// reads `selectedResult` can never see fresh results paired with a stale index.
+    @Published var selectedIndex = 0
+
+    var selectedResult: SearchResult? {
+        results.indices.contains(selectedIndex) ? results[selectedIndex] : nil
+    }
+
+    func moveSelection(by offset: Int) {
+        guard !results.isEmpty else { return }
+        selectedIndex = min(max(selectedIndex + offset, 0), results.count - 1)
+    }
 
     private init() {}
 
     private var searchTask: Task<Void, Never>?
     private var lastQuery: String = ""
 
-    /// Built once on first use instead of re-walking `/Applications` on every keystroke.
+    /// Built once on first use instead of re-walking `/Applications` on every keystroke,
+    /// then rebuilt only when `appDirectoriesChanged()` says something was installed or
+    /// removed since.
     private var cachedApps: [CachedApp]?
+    /// Modification date of every folder the last app scan walked (the roots plus any
+    /// non-bundle subfolders, like `/Applications/KiCad`), keyed by path. A folder's
+    /// mtime changes whenever an entry is added to or removed from it, so comparing
+    /// these is a handful of `stat`s — far cheaper than a filesystem watcher or a
+    /// periodic rescan, and it catches a new download the very next time you search.
+    private var appScanDirectoryDates: [String: Date?] = [:]
     private var iconCache: [String: NSImage] = [:]
     private var stickerIconCache: [String: NSImage] = [:]
 
@@ -158,6 +181,7 @@ class SearchEngine: ObservableObject {
                 $0.relevance + RankingStore.shared.boostScore(for: $0.rankingKey) >
                 $1.relevance + RankingStore.shared.boostScore(for: $1.rankingKey)
             }
+            selectedIndex = 0
         }
     }
 
@@ -280,7 +304,7 @@ class SearchEngine: ObservableObject {
         guard let value = CalculatorEngine.evaluate(query) else { return nil }
         let answer = CalculatorEngine.format(value)
         return SearchResult(
-            title: "\(query.trimmingCharacters(in: .whitespaces)) = \(answer)",
+            title: "\(CalculatorEngine.prettyPrinted(query)) = \(answer)",
             subtitle: "Press Enter to copy \(answer) to the clipboard",
             type: .calculator,
             systemIcon: "equal",
@@ -430,13 +454,13 @@ class SearchEngine: ObservableObject {
                 icon: icon,
                 relevance: 0.5,
                 rankingKey: path,
-                action: { NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: path), configuration: NSWorkspace.OpenConfiguration()) }
+                action: { Self.launchApplication(at: path) }
             )
         }
     }
     
     private func loadApps() async -> [CachedApp] {
-        if let cachedApps { return cachedApps }
+        if let cachedApps, !appDirectoriesChanged() { return cachedApps }
 
         let appDirs = [
             "/Applications",
@@ -446,12 +470,21 @@ class SearchEngine: ObservableObject {
         ]
 
         var apps: [CachedApp] = []
+        var directoryDates: [String: Date?] = [:]
 
         for dir in appDirs {
+            // Recorded even when the folder doesn't exist (nil), so creating
+            // ~/Applications later also counts as a change.
+            directoryDates[dir] = Self.modificationDate(ofPath: dir)
             guard let enumerator = FileManager.default.enumerator(atPath: dir) else { continue }
 
             for case let file as String in enumerator {
-                guard file.hasSuffix(".app") else { continue }
+                guard file.hasSuffix(".app") else {
+                    if enumerator.fileAttributes?[.type] as? FileAttributeType == .typeDirectory {
+                        directoryDates[(dir as NSString).appendingPathComponent(file)] = enumerator.fileAttributes?[.modificationDate] as? Date
+                    }
+                    continue
+                }
 
                 let fullPath = (dir as NSString).appendingPathComponent(file)
                 let appName = URL(fileURLWithPath: file).deletingPathExtension().lastPathComponent
@@ -468,7 +501,18 @@ class SearchEngine: ObservableObject {
         }
 
         cachedApps = apps
+        appScanDirectoryDates = directoryDates
         return apps
+    }
+
+    private func appDirectoriesChanged() -> Bool {
+        appScanDirectoryDates.contains { path, date in
+            Self.modificationDate(ofPath: path) != date
+        }
+    }
+
+    private static func modificationDate(ofPath path: String) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
     }
 
     private func searchApplications(query: String) async -> [SearchResult] {
@@ -490,15 +534,34 @@ class SearchEngine: ObservableObject {
                 relevance: relevance,
                 rankingKey: path,
                 action: {
-                    NSWorkspace.shared.openApplication(
-                        at: URL(fileURLWithPath: path),
-                        configuration: NSWorkspace.OpenConfiguration()
-                    )
+                    Self.launchApplication(at: path)
                 }
             ))
         }
 
         return results
+    }
+
+    /// Launches an app, surfacing failures instead of silently doing nothing — e.g. a
+    /// freshly downloaded, still-quarantined app (like a Homebrew-installed KiCad) that
+    /// LaunchServices refuses to open. Falls back to a plain `open`, which goes through
+    /// the same path as double-clicking it in Finder (including the Gatekeeper
+    /// "downloaded from the Internet" prompt), before giving up with an alert.
+    static func launchApplication(at path: String) {
+        let url = URL(fileURLWithPath: path)
+        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+            guard let error else { return }
+            print("ReFlow[launch]: openApplication failed for \(path): \(error.localizedDescription) — falling back to NSWorkspace.open.")
+            DispatchQueue.main.async {
+                guard !NSWorkspace.shared.open(url) else { return }
+                let alert = NSAlert()
+                alert.messageText = "Couldn't open \(url.deletingPathExtension().lastPathComponent)"
+                alert.informativeText = error.localizedDescription
+                alert.alertStyle = .warning
+                NSApp.activate(ignoringOtherApps: true)
+                alert.runModal()
+            }
+        }
     }
     
     private func searchFiles(query: String) async -> [SearchResult] {

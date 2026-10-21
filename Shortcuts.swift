@@ -161,9 +161,9 @@ enum ShortcutAction: String, CaseIterable, Codable {
         case .displayPrevious: return "Move Window to Previous Display"
         case .displayNext: return "Move Window to Next Display"
         case .toggleEmojiMode: return "Toggle Emoji Search"
-        case .trashTopResult: return "Move Top Result to Trash"
-        case .moveTopResult: return "Move Top Result to…"
-        case .showInFinderTopResult: return "Show Top Result in Finder"
+        case .trashTopResult: return "Move Selected Result to Trash"
+        case .moveTopResult: return "Move Selected Result to…"
+        case .showInFinderTopResult: return "Show Selected Result in Finder"
         case .openSettings: return "Open Settings"
         }
     }

@@ -15,8 +15,9 @@ across displays.
 - **Launcher** — search installed applications, files, folders, shell scripts, and your own
   Quick Links from one search field. Results are ranked by text relevance, recency, and how
   often you actually pick them.
-- **Inline calculator** — type a math expression (`12 * (4 + 1)`) and the answer appears as
-  the top result; press Enter to copy it.
+- **Inline calculator** — type a math expression (`12 * (4 + 1)`, `3 × 4`, `3x4`, `10 ÷ 4`)
+  and the answer appears as the top result, shown with proper `×`/`÷` symbols; press Enter
+  to copy it.
 - **Shell commands** — prefix a query with `>`, `$`, or `!` to run it directly (`-l` login
   shell, so your normal `PATH` applies).
 - **File Search mode** — type `fs` (or Enter it as a suggestion) to search a dedicated set of
@@ -63,11 +64,17 @@ work, but window-tiling hotkeys will silently do nothing.
   launcher if already open
 - Click the menu bar icon to toggle the launcher; right-click it for Settings and Quit.
 - Inside the launcher:
+  - `↑` / `↓` — move the selection through the results (the list scrolls to follow);
+    `Return` runs the selected result
   - `Esc` — back out of File Search/emoji mode, then close the launcher
   - `⌘,` — open Settings
-  - `⌘Delete` / `⌘M` / `⇧⌘R` — Trash / Move to… / Show in Finder, applied to the **top**
-    result
-  - Right-click any file result for the same actions via a context menu
+  - `⌘Delete` / `⌘M` / `⇧⌘R` — Trash / Move to… / Show in Finder, applied to the
+    **selected** result
+  - Click a file result to open it; right-click it for Show in Finder, Move to…,
+    Duplicate, and Move to Trash
+  - Drag a file result out of the launcher into Finder (or any app that accepts files)
+    to copy it there
+- Newly installed or removed apps show up in search automatically — no restart needed.
 
 ### Default window-tiling shortcuts
 

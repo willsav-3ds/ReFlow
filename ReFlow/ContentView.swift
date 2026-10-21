@@ -6,9 +6,6 @@ struct LauncherView: View {
     @ObservedObject private var shortcuts = ShortcutStore.shared
     @ObservedObject private var windowController = LauncherWindowController.shared
     @State private var searchText = ""
-    @State private var selectedResult: SearchResult?
-    @State private var showingFileActions = false
-    @State private var fileToManage: URL?
     @State private var launcherKeyMonitor: Any?
     @FocusState private var isSearchFieldFocused: Bool
     @Environment(\.openSettings) private var openSettings
@@ -31,8 +28,8 @@ struct LauncherView: View {
                         // what's actually in the field, not whatever was there a moment ago.
                         Task {
                             await searchEngine.waitForPendingSearch()
-                            if let firstResult = searchEngine.results.first {
-                                execute(firstResult)
+                            if let selected = searchEngine.selectedResult {
+                                execute(selected)
                             }
                         }
                     }
@@ -69,51 +66,62 @@ struct LauncherView: View {
             Divider()
 
             // Results list
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(searchEngine.results.enumerated()), id: \.element.id) { index, result in
-                        ResultRow(result: result, isSelected: index == 0)
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                if result.type == .file {
-                                    selectedResult = result
-                                    if let subtitle = result.subtitle {
-                                        fileToManage = URL(fileURLWithPath: subtitle)
-                                    }
-                                    showingFileActions = true
-                                } else {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(searchEngine.results.enumerated()), id: \.element.id) { index, result in
+                            ResultRow(result: result, isSelected: index == searchEngine.selectedIndex)
+                                .id(result.id)
+                                .contentShape(Rectangle())
+                                // Files open on click like every other result. This used to
+                                // present a file-actions sheet instead, but a sheet on this
+                                // borderless, nonactivating panel never became usable — you
+                                // had to press Escape to get back. The same actions (plus
+                                // Duplicate) live in the context menu below.
+                                .onTapGesture {
                                     execute(result)
                                 }
-                            }
-                            .contextMenu {
-                                if result.type == .file, let fileURL = result.fileURL {
-                                    Button("Open") {
-                                        execute(result)
+                                .modifier(FileDragSource(fileURL: result.fileURL))
+                                .contextMenu {
+                                    if result.type == .file, let fileURL = result.fileURL {
+                                        Button("Open") {
+                                            execute(result)
+                                        }
+                                        Button("Show in Finder (\(shortcuts.binding(for: .showInFinderTopResult).displayString) for selected result)") {
+                                            FileOps.showInFinder(fileURL)
+                                            closeWindow()
+                                        }
+                                        Button("Move to... (\(shortcuts.binding(for: .moveTopResult).displayString) for selected result)") {
+                                            FileOps.moveWithPicker(fileURL) {
+                                                searchEngine.search(query: searchText)
+                                            }
+                                        }
+                                        Button("Duplicate") {
+                                            FileOps.duplicate(fileURL)
+                                            searchEngine.search(query: searchText)
+                                        }
+                                        Divider()
+                                        Button("Move to Trash (\(shortcuts.binding(for: .trashTopResult).displayString) for selected result)", role: .destructive) {
+                                            FileOps.trash(fileURL)
+                                            searchEngine.search(query: searchText)
+                                        }
+                                        Divider()
                                     }
-                                    Button("Show in Finder (\(shortcuts.binding(for: .showInFinderTopResult).displayString) for top result)") {
-                                        FileOps.showInFinder(fileURL)
-                                        closeWindow()
-                                    }
-                                    Button("Move to... (\(shortcuts.binding(for: .moveTopResult).displayString) for top result)") {
-                                        FileOps.moveWithPicker(fileURL) {
+                                    if let rankingKey = result.rankingKey {
+                                        Button("Reset Ranking") {
+                                            RankingStore.shared.reset(rankingKey)
                                             searchEngine.search(query: searchText)
                                         }
                                     }
-                                    Divider()
-                                    Button("Move to Trash (\(shortcuts.binding(for: .trashTopResult).displayString) for top result)", role: .destructive) {
-                                        FileOps.trash(fileURL)
-                                        searchEngine.search(query: searchText)
-                                    }
-                                    Divider()
                                 }
-                                if let rankingKey = result.rankingKey {
-                                    Button("Reset Ranking") {
-                                        RankingStore.shared.reset(rankingKey)
-                                        searchEngine.search(query: searchText)
-                                    }
-                                }
-                            }
+                        }
                     }
+                }
+                // Keep the arrow-key selection in view. A nil anchor scrolls only as far as
+                // needed, so moving within the visible rows doesn't jump the list around.
+                .onChange(of: searchEngine.selectedIndex) { _, index in
+                    guard searchEngine.results.indices.contains(index) else { return }
+                    proxy.scrollTo(searchEngine.results[index].id)
                 }
             }
         }
@@ -144,13 +152,6 @@ struct LauncherView: View {
             isSearchFieldFocused = true
             searchEngine.search(query: "")
         }
-        .sheet(isPresented: $showingFileActions) {
-            if let fileURL = fileToManage {
-                FileActionsView(fileURL: fileURL, isPresented: $showingFileActions) {
-                    closeWindow()
-                }
-            }
-        }
     }
 
     // MARK: - Keyboard-driven top-result actions
@@ -167,6 +168,14 @@ struct LauncherView: View {
                 } else {
                     closeWindow()
                 }
+                return nil
+            }
+
+            // Up/Down move the selection through the results instead of the text cursor.
+            // Only for the launcher panel itself — this monitor sees every key event in
+            // the app, and Settings' own lists and fields need their arrow keys back.
+            if event.window is LauncherPanel, event.keyCode == 125 || event.keyCode == 126 {
+                searchEngine.moveSelection(by: event.keyCode == 125 ? 1 : -1)
                 return nil
             }
 
@@ -188,18 +197,18 @@ struct LauncherView: View {
     private func handleLauncherAction(_ action: ShortcutAction) {
         switch action {
         case .trashTopResult:
-            // Same stale-results race as `onSubmit` below — wait for any in-flight search
-            // before trusting `results.first`.
+            // Same stale-results race as `onSubmit` above — wait for any in-flight search
+            // before trusting `selectedResult`.
             Task {
                 await searchEngine.waitForPendingSearch()
-                guard let fileURL = searchEngine.results.first?.fileURL else { return }
+                guard let fileURL = searchEngine.selectedResult?.fileURL else { return }
                 FileOps.trash(fileURL)
                 searchEngine.search(query: searchText)
             }
         case .moveTopResult:
             Task {
                 await searchEngine.waitForPendingSearch()
-                guard let fileURL = searchEngine.results.first?.fileURL else { return }
+                guard let fileURL = searchEngine.selectedResult?.fileURL else { return }
                 FileOps.moveWithPicker(fileURL) {
                     searchEngine.search(query: searchText)
                 }
@@ -207,7 +216,7 @@ struct LauncherView: View {
         case .showInFinderTopResult:
             Task {
                 await searchEngine.waitForPendingSearch()
-                guard let fileURL = searchEngine.results.first?.fileURL else { return }
+                guard let fileURL = searchEngine.selectedResult?.fileURL else { return }
                 FileOps.showInFinder(fileURL)
             }
         case .openSettings:
@@ -255,7 +264,7 @@ struct LauncherView: View {
 
     private var searchBarPlaceholder: String {
         switch searchEngine.searchMode {
-        case .emoji: return "Search emoji and stickers..."
+        case .emoji: return "Search emoji, symbols, and stickers..."
         case .fileSearch: return "Search files or enter a path..."
         case .launcher: return "Search apps, scripts, or type fs for File Search..."
         case .clipboardHistory: return "Search clipboard history..."
@@ -307,6 +316,23 @@ enum FileOps {
             .appendingPathComponent(url.deletingPathExtension().lastPathComponent + " copy")
             .appendingPathExtension(url.pathExtension)
         try? FileManager.default.copyItem(at: url, to: destinationURL)
+    }
+}
+
+/// Lets a file result be dragged straight out of the launcher — into Finder, Mail, a
+/// chat, anywhere that accepts files — as a copy of the file. A no-op for results with
+/// no file behind them, so dragging an app or emoji row doesn't start an empty drag.
+private struct FileDragSource: ViewModifier {
+    let fileURL: URL?
+
+    func body(content: Content) -> some View {
+        if let fileURL {
+            content.onDrag {
+                NSItemProvider(contentsOf: fileURL) ?? NSItemProvider()
+            }
+        } else {
+            content
+        }
     }
 }
 
@@ -373,66 +399,6 @@ struct ResultRow: View {
         .onHover { hovering in
             isHovering = hovering
         }
-    }
-}
-
-struct FileActionsView: View {
-    let fileURL: URL
-    @Binding var isPresented: Bool
-    let onComplete: () -> Void
-    @State private var showingDestinationPicker = false
-    
-    var body: some View {
-        VStack(spacing: 20) {
-            Image(nsImage: NSWorkspace.shared.icon(forFile: fileURL.path))
-                .resizable()
-                .frame(width: 64, height: 64)
-            
-            Text(fileURL.lastPathComponent)
-                .font(.headline)
-            
-            Text(fileURL.path)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            
-            VStack(spacing: 10) {
-                Button("Open") {
-                    NSWorkspace.shared.open(fileURL)
-                    isPresented = false
-                    onComplete()
-                }
-                .buttonStyle(.borderedProminent)
-                
-                Button("Show in Finder") {
-                    FileOps.showInFinder(fileURL)
-                    isPresented = false
-                    onComplete()
-                }
-
-                Button("Move to...") {
-                    FileOps.moveWithPicker(fileURL) {
-                        isPresented = false
-                        onComplete()
-                    }
-                }
-
-                Button("Duplicate") {
-                    FileOps.duplicate(fileURL)
-                    isPresented = false
-                }
-
-                Divider()
-
-                Button("Move to Trash", role: .destructive) {
-                    FileOps.trash(fileURL)
-                    isPresented = false
-                    onComplete()
-                }
-            }
-            .frame(width: 200)
-        }
-        .padding()
-        .frame(width: 300, height: 400)
     }
 }
 

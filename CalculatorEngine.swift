@@ -8,6 +8,48 @@ import Foundation
 /// uncatchable Objective-C exception on malformed input, which would crash the app on
 /// every mistyped or half-typed search, and this is evaluated on nearly every keystroke.
 enum CalculatorEngine {
+    /// Typographic operators people actually type (or paste) — `×`/`·` for
+    /// multiplication, `÷` for division, a true minus sign — mapped onto the ASCII ones
+    /// the parser understands. Applied before anything else looks at the input, so
+    /// "3 × 4", "3x4" and "3*4" are all the same expression.
+    private static let operatorAliases: [Character: Character] = [
+        "×": "*", "·": "*", "÷": "/", "−": "-",
+    ]
+
+    /// A letter `x` only counts as "times" when it sits between two operands ("3x4",
+    /// "(2+1) x 5"). Mapping every `x` would turn ordinary searches like "x264" or
+    /// "2x" into half-typed expressions that hide all the real results.
+    private static func normalized(_ input: String) -> String {
+        let characters = Array(input)
+        func neighbor(of index: Int, step: Int) -> Character? {
+            var i = index + step
+            while characters.indices.contains(i) {
+                if characters[i] != " " && characters[i] != "\t" { return characters[i] }
+                i += step
+            }
+            return nil
+        }
+        return String(characters.indices.map { index -> Character in
+            let char = characters[index]
+            if char == "x" || char == "X" {
+                let before = neighbor(of: index, step: -1)
+                let after = neighbor(of: index, step: 1)
+                let operandBefore = before.map { $0.isNumber || $0 == ")" || $0 == "." } ?? false
+                let operandAfter = after.map { $0.isNumber || $0 == "(" || $0 == "." } ?? false
+                return operandBefore && operandAfter ? "*" : char
+            }
+            return operatorAliases[char] ?? char
+        })
+    }
+
+    /// The expression as shown back in the result row: ASCII `*` and `/` swapped for
+    /// the real `×` and `÷` symbols, whichever way they were typed.
+    static func prettyPrinted(_ input: String) -> String {
+        normalized(input.trimmingCharacters(in: .whitespaces))
+            .replacingOccurrences(of: "*", with: "×")
+            .replacingOccurrences(of: "/", with: "÷")
+    }
+
     /// Every character a calculator expression could legitimately contain.
     private static let allowedCharacters = CharacterSet(charactersIn: "0123456789+-*/%^(). \t")
     private static let operatorCharacters = CharacterSet(charactersIn: "+-*/%^")
@@ -18,7 +60,7 @@ enum CalculatorEngine {
     /// with no operator (e.g. "5") is left alone so it still falls through to normal
     /// search rather than being hijacked into showing itself as its own "answer".
     static func looksLikeExpression(_ input: String) -> Bool {
-        let trimmed = input.trimmingCharacters(in: .whitespaces)
+        let trimmed = normalized(input).trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return false }
         guard trimmed.rangeOfCharacter(from: allowedCharacters.inverted) == nil else { return false }
         guard trimmed.rangeOfCharacter(from: .decimalDigits) != nil else { return false }
@@ -31,7 +73,7 @@ enum CalculatorEngine {
     /// that just hasn't resolved to an answer yet rather than a crash.
     static func evaluate(_ input: String) -> Double? {
         guard looksLikeExpression(input) else { return nil }
-        var parser = Parser(input)
+        var parser = Parser(normalized(input))
         guard let value = parser.parseExpression(), parser.isAtEnd, value.isFinite else { return nil }
         return value
     }

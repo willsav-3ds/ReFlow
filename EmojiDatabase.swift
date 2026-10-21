@@ -6,7 +6,8 @@ struct EmojiEntry {
     let relevance: Double
 }
 
-/// A small hardcoded set of common emoji. Easy to extend with more entries later.
+/// A small hardcoded set of common emoji, plus hard-to-type symbols (math, arrows,
+/// typography, currency, Mac key glyphs). Easy to extend with more entries later.
 final class EmojiDatabase {
     static let shared = EmojiDatabase()
 
@@ -94,6 +95,69 @@ final class EmojiDatabase {
         Entry(emoji: "☀️", keywords: ["sun", "sunny", "weather"]),
         Entry(emoji: "🌧️", keywords: ["rain", "weather", "cloud"]),
         Entry(emoji: "🌙", keywords: ["moon", "night"]),
+
+        // Symbols — not emoji, but the same "search by name, paste it in" job, for the
+        // characters that are a pain to type: math, arrows, typography, currency, and
+        // the Mac's own modifier-key glyphs.
+        Entry(emoji: "×", keywords: ["multiply", "multiplication", "times", "x"]),
+        Entry(emoji: "÷", keywords: ["divide", "division", "obelus"]),
+        Entry(emoji: "±", keywords: ["plusminus", "plus minus", "tolerance"]),
+        Entry(emoji: "−", keywords: ["minus", "subtract"]),
+        Entry(emoji: "≠", keywords: ["notequal", "not equal", "unequal"]),
+        Entry(emoji: "≈", keywords: ["approximately", "approx", "almost equal"]),
+        Entry(emoji: "≤", keywords: ["lessthanorequal", "less than or equal", "lte"]),
+        Entry(emoji: "≥", keywords: ["greaterthanorequal", "greater than or equal", "gte"]),
+        Entry(emoji: "√", keywords: ["sqrt", "square root", "root", "radical"]),
+        Entry(emoji: "∞", keywords: ["infinity", "infinite"]),
+        Entry(emoji: "π", keywords: ["pi"]),
+        Entry(emoji: "°", keywords: ["degree", "degrees", "temperature"]),
+        Entry(emoji: "∑", keywords: ["sum", "sigma", "summation"]),
+        Entry(emoji: "∆", keywords: ["delta", "change", "triangle"]),
+        Entry(emoji: "µ", keywords: ["micro", "mu"]),
+        Entry(emoji: "Ω", keywords: ["ohm", "omega", "resistance"]),
+        Entry(emoji: "θ", keywords: ["theta", "angle"]),
+        Entry(emoji: "λ", keywords: ["lambda", "wavelength"]),
+        Entry(emoji: "∫", keywords: ["integral"]),
+        Entry(emoji: "∂", keywords: ["partial", "derivative"]),
+        Entry(emoji: "‰", keywords: ["permille", "per mille"]),
+        Entry(emoji: "½", keywords: ["half", "one half", "fraction"]),
+        Entry(emoji: "¼", keywords: ["quarter", "one quarter", "fraction"]),
+        Entry(emoji: "¾", keywords: ["three quarters", "fraction"]),
+        Entry(emoji: "²", keywords: ["squared", "superscript two"]),
+        Entry(emoji: "³", keywords: ["cubed", "superscript three"]),
+        Entry(emoji: "→", keywords: ["arrow right", "right arrow", "to", "then"]),
+        Entry(emoji: "←", keywords: ["arrow left", "left arrow", "back"]),
+        Entry(emoji: "↑", keywords: ["arrow up", "up arrow"]),
+        Entry(emoji: "↓", keywords: ["arrow down", "down arrow"]),
+        Entry(emoji: "↔", keywords: ["arrow left right", "both ways", "bidirectional"]),
+        Entry(emoji: "⇒", keywords: ["implies", "double arrow", "therefore"]),
+        Entry(emoji: "∴", keywords: ["therefore"]),
+        Entry(emoji: "✓", keywords: ["checkmark", "tick", "check"]),
+        Entry(emoji: "✗", keywords: ["ballot x", "cross", "mark"]),
+        Entry(emoji: "•", keywords: ["bullet", "dot", "point"]),
+        Entry(emoji: "…", keywords: ["ellipsis", "dots"]),
+        Entry(emoji: "—", keywords: ["em dash", "emdash", "dash"]),
+        Entry(emoji: "–", keywords: ["en dash", "endash", "dash", "range"]),
+        Entry(emoji: "©", keywords: ["copyright"]),
+        Entry(emoji: "®", keywords: ["registered", "trademark"]),
+        Entry(emoji: "™", keywords: ["trademark", "tm"]),
+        Entry(emoji: "§", keywords: ["section"]),
+        Entry(emoji: "¶", keywords: ["paragraph", "pilcrow"]),
+        Entry(emoji: "†", keywords: ["dagger", "footnote"]),
+        Entry(emoji: "«", keywords: ["guillemet left", "quote"]),
+        Entry(emoji: "»", keywords: ["guillemet right", "quote"]),
+        Entry(emoji: "€", keywords: ["euro", "currency", "money"]),
+        Entry(emoji: "£", keywords: ["pound", "sterling", "currency", "money"]),
+        Entry(emoji: "¥", keywords: ["yen", "yuan", "currency", "money"]),
+        Entry(emoji: "¢", keywords: ["cent", "currency", "money"]),
+        Entry(emoji: "⌘", keywords: ["command", "cmd", "key"]),
+        Entry(emoji: "⌥", keywords: ["option", "alt", "key"]),
+        Entry(emoji: "⌃", keywords: ["control", "ctrl", "key"]),
+        Entry(emoji: "⇧", keywords: ["shift", "key"]),
+        Entry(emoji: "⏎", keywords: ["return", "enter", "key"]),
+        Entry(emoji: "⌫", keywords: ["delete", "backspace", "key"]),
+        Entry(emoji: "⎋", keywords: ["escape", "esc", "key"]),
+        Entry(emoji: "", keywords: ["apple", "logo"]),
     ]
 
     func search(query: String) -> [EmojiEntry] {
