@@ -1,4 +1,6 @@
 import AppKit
+import ImageIO
+import UniformTypeIdentifiers
 
 /// Pastes emoji/sticker/clipboard-history selections back into whatever app was
 /// frontmost before the launcher opened. There's no public API to insert text or an
@@ -18,24 +20,42 @@ enum ClipboardPaste {
         ClipboardHistoryStore.shared.suppressNextChange()
         setClipboard()
 
-        // Short delays after the launcher panel starts closing (triggered by the
-        // caller's own result-execution flow, just before or right after this runs)
-        // before reactivating the original app and simulating ⌘V — giving the window
-        // server a moment to actually hand focus back avoids the paste landing nowhere,
-        // or in ReFlow's own panel as it's disappearing.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            appToRestore?.activate()
+        // Deferred one run loop turn so the launcher panel (closed by the caller's own
+        // result-execution flow right after this returns) is gone first. The panel is
+        // nonactivating, so the original app is normally *still* frontmost and only
+        // needs its key window back — this used to wait a flat 300ms on every paste
+        // regardless; now it only waits as long as focus actually takes to return.
+        DispatchQueue.main.async {
+            if let appToRestore, NSWorkspace.shared.frontmostApplication != appToRestore {
+                appToRestore.activate()
+            }
+            whenFrontmost(appToRestore, deadline: Date().addingTimeInterval(0.4)) {
+                // A beat for the window server to hand key status back to that app's
+                // window, so ⌘V doesn't land nowhere or in ReFlow's vanishing panel.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) {
+                    postCommandV()
 
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                postCommandV()
-
-                // Give the target app a moment to actually read the pasteboard on its
-                // end before we swap the contents back out from under it.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    ClipboardHistoryStore.shared.suppressNextChange()
-                    restorePasteboard(previousClipboard)
+                    // Give the target app a moment to actually read the pasteboard on its
+                    // end before we swap the contents back out from under it. Invisible
+                    // to the user — the paste has already happened by now.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                        ClipboardHistoryStore.shared.suppressNextChange()
+                        restorePasteboard(previousClipboard)
+                    }
                 }
             }
+        }
+    }
+
+    /// Runs `body` as soon as `app` is the frontmost application (checking every 10ms),
+    /// or at `deadline` regardless, so a slow-to-activate app can't hang the paste.
+    private static func whenFrontmost(_ app: NSRunningApplication?, deadline: Date, _ body: @escaping () -> Void) {
+        guard let app, NSWorkspace.shared.frontmostApplication != app, Date() < deadline else {
+            body()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) {
+            whenFrontmost(app, deadline: deadline, body)
         }
     }
 
@@ -54,11 +74,16 @@ enum ClipboardPaste {
     /// later — `NSPasteboardItem` doesn't let you hold onto a live reference to what's
     /// already there (the system pasteboard can invalidate it), so each item is copied
     /// into a fresh one holding the same data under the same types.
+    ///
+    /// `dyn.*` types are skipped: they're conversions the system derives on demand from
+    /// the item's real types, and asking for each one makes the source app render yet
+    /// another copy of its content — the slow part of snapshotting a big image or rich
+    /// text. Restoring the real types brings those conversions back automatically.
     private static func snapshotPasteboard() -> [NSPasteboardItem] {
         guard let items = NSPasteboard.general.pasteboardItems else { return [] }
         return items.map { item in
             let copy = NSPasteboardItem()
-            for type in item.types {
+            for type in item.types where !type.rawValue.hasPrefix("dyn.") {
                 if let data = item.data(forType: type) {
                     copy.setData(data, forType: type)
                 }
@@ -92,20 +117,26 @@ enum ClipboardPaste {
     }
 
     /// Puts a sticker image/GIF file on the clipboard with multiple representations, so
-    /// whatever the target app prefers to accept on paste is available: the raw file data
-    /// under its own animated-GIF type (so apps that support pasting animated GIFs, e.g.
+    /// whatever the target app prefers to accept on paste is available: the raw file
+    /// bytes under the file's own type (so apps that support pasting animated GIFs, e.g.
     /// Messages, keep the animation instead of freezing on one frame), a flattened
-    /// bitmap for apps that only accept image data, and the file's own URL for apps that
-    /// treat a paste as attaching a file.
+    /// bitmap for apps that only accept TIFF, and the file's own URL for apps that treat
+    /// a paste as attaching a file.
+    ///
+    /// The TIFF is built from the first frame only. `NSImage.tiffRepresentation` on an
+    /// animated GIF encodes *every* frame uncompressed — easily tens of megabytes, and
+    /// the main reason pasting a sticker used to lag.
     static func copySticker(fileURL: URL) {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
 
         if let data = try? Data(contentsOf: fileURL) {
-            if fileURL.pathExtension.lowercased() == "gif" {
-                pasteboard.setData(data, forType: NSPasteboard.PasteboardType("com.compuserve.gif"))
+            if let type = UTType(filenameExtension: fileURL.pathExtension), type.conforms(to: .image) {
+                pasteboard.setData(data, forType: NSPasteboard.PasteboardType(type.identifier))
             }
-            if let image = NSImage(data: data), let tiff = image.tiffRepresentation {
+            if let source = CGImageSourceCreateWithData(data as CFData, nil),
+               let firstFrame = CGImageSourceCreateImageAtIndex(source, 0, nil),
+               let tiff = NSBitmapImageRep(cgImage: firstFrame).tiffRepresentation {
                 pasteboard.setData(tiff, forType: .tiff)
             }
         }
