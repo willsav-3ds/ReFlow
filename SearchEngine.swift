@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import ImageIO
 import UniformTypeIdentifiers
 import Combine
 
@@ -45,26 +46,54 @@ class SearchEngine: ObservableObject {
     /// then rebuilt only when `appDirectoriesChanged()` says something was installed or
     /// removed since.
     private var cachedApps: [CachedApp]?
-    /// Modification date of every folder the last app scan walked (the roots plus any
-    /// non-bundle subfolders, like `/Applications/KiCad`), keyed by path. A folder's
-    /// mtime changes whenever an entry is added to or removed from it, so comparing
-    /// these is a handful of `stat`s — far cheaper than a filesystem watcher or a
-    /// periodic rescan, and it catches a new download the very next time you search.
+    /// Modification date of each app folder root and its direct subfolders (like
+    /// `/Applications/KiCad`), keyed by path. A folder's mtime changes whenever an entry
+    /// is added to or removed from it, so comparing these is a few dozen `stat`s — far
+    /// cheaper than a filesystem watcher or a periodic rescan, and it catches a new
+    /// download the next time you search. Deliberately only one level deep: the scan
+    /// itself walks every nested folder, and tracking all of those (Unity's install
+    /// alone is well over a thousand, and game folders churn whenever they patch) made
+    /// the check slow enough to lag typing and kept triggering needless full rescans.
     private var appScanDirectoryDates: [String: Date?] = [:]
-    private var iconCache: [String: NSImage] = [:]
+    /// Throttles `appDirectoriesChanged()` — searches fire on nearly every keystroke,
+    /// but a new install only needs to be noticed within a second or two.
+    private var lastAppDirectoryCheck = Date.distantPast
+    private static let appDirectoryCheckInterval: TimeInterval = 2
+    /// The scan currently filling `cachedApps`, if any — shared so concurrent searches
+    /// wait on one scan instead of each starting their own.
+    private var appScanTask: Task<[CachedApp], Never>?
     private var stickerIconCache: [String: NSImage] = [:]
 
-    private struct CachedApp {
+    /// Script files found in `scriptSearchPaths`, rescanned in the background each time
+    /// the launcher opens (see `search(query:)`) rather than walked on every keystroke.
+    private var cachedScripts: [URL]?
+    private var scriptScanTask: Task<[URL], Never>?
+
+    /// Plain values, so the scan that builds them can run off the main thread. Icons
+    /// aren't part of it: they're loaded lazily by `ResultRow`, only for rows actually
+    /// on screen (see `IconCache`).
+    nonisolated struct CachedApp: Sendable {
         let title: String
         let path: String
-        let icon: NSImage
     }
 
+    /// The most results a search ever shows. Short or fuzzy queries can match hundreds
+    /// of apps or files; nobody scrolls that far, and every extra row is SwiftUI work.
+    private static let maxResults = 50
+
     /// Read-only snapshot of the in-memory caches above, for the debug stats window only
-    /// — nothing here is read by search itself. `apps` is `nil` until the first search
-    /// actually triggers `loadApps()`.
+    /// — nothing here is read by search itself. `apps` is `nil` until the app scan
+    /// (started at launch by `warmUp()`) has finished.
     var cacheStats: (apps: Int?, icons: Int, stickerIcons: Int) {
-        (cachedApps?.count, iconCache.count, stickerIconCache.count)
+        (cachedApps?.count, IconCache.shared.count, stickerIconCache.count)
+    }
+
+    /// Builds the app list in the background at launch, so the very first search after
+    /// starting ReFlow doesn't have to wait for it.
+    func warmUp() {
+        if cachedApps == nil && appScanTask == nil {
+            startAppScan()
+        }
     }
 
     /// Folders scripts are searched in. Fully user-managed (Settings → Scripts) — nothing
@@ -126,12 +155,20 @@ class SearchEngine: ObservableObject {
         searchTask?.cancel()
         lastQuery = query
 
+        // An empty launcher query means the launcher just opened (or was cleared):
+        // pick up scripts added since last time, in the background, so typing itself
+        // only ever filters what's already in memory.
+        if query.isEmpty && searchMode == .launcher {
+            refreshScripts()
+        }
+
         searchTask = Task {
-            // Debounce: wait a beat for more keystrokes before doing any real work.
-            // Skipped for an empty query so clearing the field shows defaults instantly.
-            if !query.isEmpty {
+            // Debounce: only File Search still walks the disk per query, so only it waits
+            // a beat for more keystrokes first. Every other mode filters in-memory data
+            // and answers instantly — debouncing those just added lag to every keystroke.
+            if !query.isEmpty && searchMode == .fileSearch {
                 do {
-                    try await Task.sleep(for: .milliseconds(120))
+                    try await Task.sleep(for: .milliseconds(80))
                 } catch {
                     return // superseded before the debounce even elapsed
                 }
@@ -177,10 +214,12 @@ class SearchEngine: ObservableObject {
             guard !Task.isCancelled else { return }
             // Usage-based ranking: nudge frequently-launched items up, without letting
             // the boost outweigh genuine text relevance (see RankingStore.boostScore).
-            results = newResults.sorted {
-                $0.relevance + RankingStore.shared.boostScore(for: $0.rankingKey) >
-                $1.relevance + RankingStore.shared.boostScore(for: $1.rankingKey)
-            }
+            // Scores are computed once per result rather than inside the comparator.
+            results = newResults
+                .map { ($0, $0.relevance + RankingStore.shared.boostScore(for: $0.rankingKey)) }
+                .sorted { $0.1 > $1.1 }
+                .prefix(Self.maxResults)
+                .map(\.0)
             selectedIndex = 0
         }
     }
@@ -356,7 +395,7 @@ class SearchEngine: ObservableObject {
                 title: url.lastPathComponent,
                 subtitle: expandedPath,
                 type: .file,
-                icon: icon(for: expandedPath),
+                iconPath: expandedPath,
                 relevance: 1.0,
                 fileURL: url,
                 rankingKey: expandedPath,
@@ -374,19 +413,43 @@ class SearchEngine: ObservableObject {
     /// opening File Search greets you with what's probably on your mind (something you
     /// just downloaded or touched) instead of a blank list.
     private func getDefaultFileResults() async -> [SearchResult] {
-        let searchDirs = Self.fileSearchPaths.map { URL(fileURLWithPath: $0) }
+        let mostRecent = await Self.recentFiles(in: Self.fileSearchPaths)
 
+        // Relevance here isn't a text-match score — there's no query — so encode the
+        // recency ranking directly into it, spaced widely enough that the usage-based
+        // boost (see the sort in `search(query:)`) can still nudge a frequently-opened
+        // file up without completely scrambling the recency order.
+        return mostRecent.enumerated().map { index, url in
+            SearchResult(
+                title: url.lastPathComponent,
+                subtitle: url.path,
+                type: .file,
+                iconPath: url.path,
+                relevance: max(0.01, 1.0 - Double(index) * 0.01),
+                fileURL: url,
+                rankingKey: url.path,
+                action: {
+                    NSWorkspace.shared.open(url)
+                }
+            )
+        }
+    }
+
+    /// The walk behind `getDefaultFileResults`, off the main thread.
+    @concurrent
+    private nonisolated static func recentFiles(in paths: [String]) async -> [URL] {
+        let keys: [URLResourceKey] = [.isDirectoryKey, .addedToDirectoryDateKey, .contentModificationDateKey]
         var candidates: [(url: URL, date: Date)] = []
 
-        for dir in searchDirs {
+        for path in paths {
             guard let enumerator = FileManager.default.enumerator(
-                at: dir,
-                includingPropertiesForKeys: [.isDirectoryKey, .addedToDirectoryDateKey, .contentModificationDateKey],
+                at: URL(fileURLWithPath: path),
+                includingPropertiesForKeys: keys,
                 options: [.skipsHiddenFiles, .skipsPackageDescendants]
             ) else { continue }
 
             var examined = 0
-            for case let fileURL as URL in enumerator {
+            while let fileURL = enumerator.nextObject() as? URL {
                 if Task.isCancelled { return [] }
                 // A soft cap on how many entries we look at per folder — sorting by date
                 // needs a broad-enough scan to actually find the true most-recent files
@@ -396,7 +459,7 @@ class SearchEngine: ObservableObject {
                 guard examined < 200 else { break }
                 examined += 1
 
-                let values = try? fileURL.resourceValues(forKeys: [.isDirectoryKey, .addedToDirectoryDateKey, .contentModificationDateKey])
+                let values = try? fileURL.resourceValues(forKeys: Set(keys))
                 guard values?.isDirectory != true else { continue }
                 // Prefer contentModificationDate: addedToDirectoryDate reflects when a
                 // file last landed in this folder (any move/copy/extract resets it), not
@@ -407,26 +470,7 @@ class SearchEngine: ObservableObject {
             }
         }
 
-        let mostRecent = candidates.sorted { $0.date > $1.date }.prefix(20)
-
-        // Relevance here isn't a text-match score — there's no query — so encode the
-        // recency ranking directly into it, spaced widely enough that the usage-based
-        // boost (see the sort in `search(query:)`) can still nudge a frequently-opened
-        // file up without completely scrambling the recency order.
-        return mostRecent.enumerated().map { index, entry in
-            SearchResult(
-                title: entry.url.lastPathComponent,
-                subtitle: entry.url.path,
-                type: .file,
-                icon: icon(for: entry.url.path),
-                relevance: max(0.01, 1.0 - Double(index) * 0.01),
-                fileURL: entry.url,
-                rankingKey: entry.url.path,
-                action: {
-                    NSWorkspace.shared.open(entry.url)
-                }
-            )
-        }
+        return candidates.sorted { $0.date > $1.date }.prefix(20).map(\.url)
     }
 
     private func getDefaultResults() async -> [SearchResult] {
@@ -440,18 +484,18 @@ class SearchEngine: ObservableObject {
         ]
         
         return appPaths.compactMap { path in
-            guard FileManager.default.fileExists(atPath: path),
-                  let bundle = Bundle(path: path) else { return nil }
-            
-            let name = bundle.infoDictionary?["CFBundleName"] as? String ?? 
-                       URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
-            let icon = NSWorkspace.shared.icon(forFile: path)
-            
+            guard FileManager.default.fileExists(atPath: path) else { return nil }
+
+            // Prefer the already-scanned name; reading Info.plist directly otherwise,
+            // rather than via `Bundle(path:)`, which Foundation caches for the life of
+            // the process.
+            let name = cachedApps?.first(where: { $0.path == path })?.title ?? Self.appDisplayName(at: path)
+
             return SearchResult(
                 title: name,
                 subtitle: path,
                 type: .application,
-                icon: icon,
+                iconPath: path,
                 relevance: 0.5,
                 rankingKey: path,
                 action: { Self.launchApplication(at: path) }
@@ -459,9 +503,38 @@ class SearchEngine: ObservableObject {
         }
     }
     
+    /// Returns the cached app list immediately whenever there is one — starting a
+    /// background rescan if the app folders changed, and serving the old list until it
+    /// lands — so a search never waits on the disk except before the very first scan.
     private func loadApps() async -> [CachedApp] {
-        if let cachedApps, !appDirectoriesChanged() { return cachedApps }
+        if let cachedApps {
+            if appScanTask == nil, appDirectoriesChanged() {
+                startAppScan()
+            }
+            return cachedApps
+        }
+        if appScanTask == nil {
+            startAppScan()
+        }
+        return await appScanTask?.value ?? []
+    }
 
+    private func startAppScan() {
+        // Unstructured on purpose: a search being superseded mid-scan shouldn't throw
+        // the scan away, since the next keystroke needs the same list.
+        appScanTask = Task {
+            let scan = await Self.scanApplications()
+            cachedApps = scan.apps
+            appScanDirectoryDates = scan.directoryDates
+            lastAppDirectoryCheck = Date()
+            appScanTask = nil
+            return scan.apps
+        }
+    }
+
+    /// The actual walk of the app folders, off the main thread.
+    @concurrent
+    private nonisolated static func scanApplications() async -> (apps: [CachedApp], directoryDates: [String: Date?]) {
         let appDirs = [
             "/Applications",
             "/System/Applications",
@@ -475,43 +548,43 @@ class SearchEngine: ObservableObject {
         for dir in appDirs {
             // Recorded even when the folder doesn't exist (nil), so creating
             // ~/Applications later also counts as a change.
-            directoryDates[dir] = Self.modificationDate(ofPath: dir)
+            directoryDates[dir] = modificationDate(ofPath: dir)
             guard let enumerator = FileManager.default.enumerator(atPath: dir) else { continue }
 
-            for case let file as String in enumerator {
+            while let file = enumerator.nextObject() as? String {
                 guard file.hasSuffix(".app") else {
-                    if enumerator.fileAttributes?[.type] as? FileAttributeType == .typeDirectory {
+                    if enumerator.level == 1, enumerator.fileAttributes?[.type] as? FileAttributeType == .typeDirectory {
                         directoryDates[(dir as NSString).appendingPathComponent(file)] = enumerator.fileAttributes?[.modificationDate] as? Date
                     }
                     continue
                 }
 
                 let fullPath = (dir as NSString).appendingPathComponent(file)
-                let appName = URL(fileURLWithPath: file).deletingPathExtension().lastPathComponent
-
-                if let bundle = Bundle(path: fullPath) {
-                    let displayName = bundle.infoDictionary?["CFBundleName"] as? String ?? appName
-                    let icon = NSWorkspace.shared.icon(forFile: fullPath)
-                    apps.append(CachedApp(title: displayName, path: fullPath, icon: icon))
-                }
+                apps.append(CachedApp(title: appDisplayName(at: fullPath), path: fullPath))
 
                 // Don't recurse into .app bundles
                 enumerator.skipDescendants()
             }
         }
 
-        cachedApps = apps
-        appScanDirectoryDates = directoryDates
-        return apps
+        return (apps, directoryDates)
+    }
+
+    /// An app's `CFBundleName`, falling back to its file name.
+    private nonisolated static func appDisplayName(at path: String) -> String {
+        let info = NSDictionary(contentsOfFile: (path as NSString).appendingPathComponent("Contents/Info.plist"))
+        return info?["CFBundleName"] as? String ?? URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
     }
 
     private func appDirectoriesChanged() -> Bool {
-        appScanDirectoryDates.contains { path, date in
+        guard Date().timeIntervalSince(lastAppDirectoryCheck) >= Self.appDirectoryCheckInterval else { return false }
+        lastAppDirectoryCheck = Date()
+        return appScanDirectoryDates.contains { path, date in
             Self.modificationDate(ofPath: path) != date
         }
     }
 
-    private static func modificationDate(ofPath path: String) -> Date? {
+    private nonisolated static func modificationDate(ofPath path: String) -> Date? {
         (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
     }
 
@@ -530,7 +603,7 @@ class SearchEngine: ObservableObject {
                 title: app.title,
                 subtitle: path,
                 type: .application,
-                icon: app.icon,
+                iconPath: path,
                 relevance: relevance,
                 rankingKey: path,
                 action: {
@@ -565,62 +638,78 @@ class SearchEngine: ObservableObject {
     }
     
     private func searchFiles(query: String) async -> [SearchResult] {
-        var results: [SearchResult] = []
+        let hits = await Self.findFiles(
+            matching: query,
+            in: Self.fileSearchPaths,
+            scopeLimit: Self.limitFileSearchScope ? Self.fileSearchScopeLimit : nil
+        )
+        return hits.map { hit in
+            let fileURL = hit.url
+            return SearchResult(
+                title: fileURL.lastPathComponent,
+                subtitle: fileURL.path,
+                type: .file,
+                iconPath: fileURL.path,
+                relevance: hit.relevance,
+                fileURL: fileURL,
+                rankingKey: fileURL.path,
+                action: {
+                    NSWorkspace.shared.open(fileURL)
+                }
+            )
+        }
+    }
 
-        // Search the folders configured in Settings → File Search.
-        let searchDirs = Self.fileSearchPaths.map { URL(fileURLWithPath: $0) }
+    nonisolated struct FileHit: Sendable {
+        let url: URL
+        let relevance: Double
+    }
 
-        for dir in searchDirs {
+    /// The File Search walk itself, off the main thread so typing never stalls on the
+    /// disk. Called from the search task with `await`, so it inherits that task's
+    /// cancellation: a newer keystroke stops a stale walk partway through.
+    @concurrent
+    private nonisolated static func findFiles(matching query: String, in paths: [String], scopeLimit: Int?) async -> [FileHit] {
+        var hits: [FileHit] = []
+
+        for path in paths {
             guard let enumerator = FileManager.default.enumerator(
-                at: dir,
-                includingPropertiesForKeys: [.nameKey, .isDirectoryKey],
+                at: URL(fileURLWithPath: path),
+                // The dates are prefetched for `recencyBonus`, so it doesn't go back to
+                // the disk once per match.
+                includingPropertiesForKeys: [.addedToDirectoryDateKey, .contentModificationDateKey],
                 options: [.skipsHiddenFiles, .skipsPackageDescendants]
             ) else { continue }
-            
+
             var count = 0
             var examined = 0
-            for case let fileURL as URL in enumerator {
+            while let fileURL = enumerator.nextObject() as? URL {
                 if Task.isCancelled { return [] }
                 guard count < 20 else { break } // Limit results per directory
                 // Only bail early on how many files we've looked at (as opposed to how many
                 // matches we've kept) when the user's opted into it — otherwise a query with
                 // few or no matches always walks every nested file in Documents/Downloads/
                 // Desktop before giving up, however long that takes, so nothing is ever missed.
-                if Self.limitFileSearchScope {
-                    guard examined < Self.fileSearchScopeLimit else { break }
+                if let scopeLimit {
+                    guard examined < scopeLimit else { break }
                     examined += 1
                 }
 
-                let fileName = fileURL.lastPathComponent
-                let textRelevance = Self.calculateRelevance(text: fileName, query: query)
+                let textRelevance = calculateRelevance(text: fileURL.lastPathComponent, query: query)
 
                 // Threshold on text relevance alone — recency should never let an
                 // otherwise-irrelevant file leak through, only break ties/near-ties in
                 // favor of whatever was added or changed more recently.
                 guard textRelevance > 0.3 else { continue }
 
-                let icon = icon(for: fileURL.path)
-
-                results.append(SearchResult(
-                    title: fileName,
-                    subtitle: fileURL.path,
-                    type: .file,
-                    icon: icon,
-                    relevance: textRelevance + Self.recencyBonus(for: fileURL),
-                    fileURL: fileURL,
-                    rankingKey: fileURL.path,
-                    action: {
-                        NSWorkspace.shared.open(fileURL)
-                    }
-                ))
-
+                hits.append(FileHit(url: fileURL, relevance: textRelevance + recencyBonus(for: fileURL)))
                 count += 1
             }
         }
-        
-        return results
+
+        return hits
     }
-    
+
     private func searchScripts(query: String) async -> [SearchResult] {
         var results: [SearchResult] = []
         
@@ -642,57 +731,77 @@ class SearchEngine: ObservableObject {
             }
         }
         
-        // Search only the folders configured in Settings → Scripts — nothing else is
-        // scanned automatically.
-        let scriptDirs = Self.scriptSearchPaths.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+        for fileURL in await scriptURLs() {
+            let fileName = fileURL.lastPathComponent
+            let relevance = Self.calculateRelevance(text: fileName, query: query)
 
-        let scriptExtensions = ["sh", "command", "py", "rb", "js", "swift"]
+            guard relevance > 0.3 else { continue }
 
-        for dir in scriptDirs {
+            results.append(SearchResult(
+                title: fileName,
+                subtitle: fileURL.path,
+                type: .script,
+                systemIcon: "terminal.fill",
+                relevance: relevance,
+                rankingKey: fileURL.path,
+                action: {
+                    self.executeScript(at: fileURL)
+                }
+            ))
+        }
+
+        return results
+    }
+
+    /// The cached script list, waiting on a scan only if there's never been one.
+    private func scriptURLs() async -> [URL] {
+        if let cachedScripts { return cachedScripts }
+        refreshScripts()
+        return await scriptScanTask?.value ?? []
+    }
+
+    /// Rescans the script folders in the background, keeping the old list in use until
+    /// the new one lands. A no-op while a scan is already running.
+    private func refreshScripts() {
+        guard scriptScanTask == nil else { return }
+        let paths = Self.scriptSearchPaths
+        scriptScanTask = Task {
+            let scripts = await Self.scanScripts(in: paths)
+            cachedScripts = scripts
+            scriptScanTask = nil
+            return scripts
+        }
+    }
+
+    /// Search only the folders configured in Settings → Scripts — nothing else is
+    /// scanned automatically. Off the main thread.
+    @concurrent
+    private nonisolated static func scanScripts(in paths: [String]) async -> [URL] {
+        let scriptExtensions: Set<String> = ["sh", "command", "py", "rb", "js", "swift"]
+        var scripts: [URL] = []
+
+        for path in paths {
             guard let enumerator = FileManager.default.enumerator(
-                at: dir,
+                at: URL(fileURLWithPath: (path as NSString).expandingTildeInPath),
                 includingPropertiesForKeys: [.nameKey],
                 options: [.skipsHiddenFiles]
             ) else { continue }
-            
-            for case let fileURL as URL in enumerator {
-                if Task.isCancelled { return [] }
-                guard scriptExtensions.contains(fileURL.pathExtension.lowercased()) else { continue }
 
-                let fileName = fileURL.lastPathComponent
-                let relevance = Self.calculateRelevance(text: fileName, query: query)
-                
-                guard relevance > 0.3 else { continue }
-                
-                results.append(SearchResult(
-                    title: fileName,
-                    subtitle: fileURL.path,
-                    type: .script,
-                    systemIcon: "terminal.fill",
-                    relevance: relevance,
-                    rankingKey: fileURL.path,
-                    action: {
-                        self.executeScript(at: fileURL)
-                    }
-                ))
+            while let fileURL = enumerator.nextObject() as? URL {
+                if scriptExtensions.contains(fileURL.pathExtension.lowercased()) {
+                    scripts.append(fileURL)
+                }
             }
         }
-        
-        return results
-    }
-    
-    private func icon(for path: String) -> NSImage {
-        if let cached = iconCache[path] { return cached }
-        let icon = NSWorkspace.shared.icon(forFile: path)
-        iconCache[path] = icon
-        return icon
+
+        return scripts
     }
 
     /// A small, decaying bonus for files added or changed recently — so among similar
     /// text matches, something downloaded yesterday outranks something untouched for
     /// years. Capped well below a full relevance tier so it only breaks ties/near-ties,
     /// never promotes an irrelevant match past a genuine one.
-    static func recencyBonus(for url: URL) -> Double {
+    nonisolated static func recencyBonus(for url: URL) -> Double {
         let values = try? url.resourceValues(forKeys: [.addedToDirectoryDateKey, .contentModificationDateKey])
         // Prefer contentModificationDate over addedToDirectoryDate — see the matching
         // comment in getDefaultFileResults for why.
@@ -705,7 +814,7 @@ class SearchEngine: ObservableObject {
         return max(0, maxBonus - min(ageInDays, decayDays) / decayDays * maxBonus)
     }
 
-    static func calculateRelevance(text: String, query: String) -> Double {
+    nonisolated static func calculateRelevance(text: String, query: String) -> Double {
         let lowerText = text.lowercased()
         let lowerQuery = query.lowercased()
         
@@ -741,46 +850,54 @@ class SearchEngine: ObservableObject {
     
     private func executeShellCommand(_ command: String) {
         Task {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            // `-l` (login shell) makes zsh source `~/.zprofile`/`~/.zlogin` the same way
-            // opening Terminal does. Without it, this only gets `/etc/zshenv`'s minimal
-            // PATH — anything installed via Homebrew, pip, etc. (added to PATH in
-            // `~/.zprofile`, the usual place) silently can't be found, since ReFlow itself
-            // was launched by Finder/LaunchServices, not a login shell.
-            process.arguments = ["-l", "-c", command]
-
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = pipe
-            
-            do {
-                try process.run()
-                process.waitUntilExit()
-                
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                if let output = String(data: data, encoding: .utf8), !output.isEmpty {
-                    // Show output in a dialog
-                    await MainActor.run {
-                        let alert = NSAlert()
-                        alert.messageText = "Command Output"
-                        alert.informativeText = output
-                        alert.alertStyle = .informational
-                        alert.runModal()
-                    }
-                }
-            } catch {
-                await MainActor.run {
-                    let alert = NSAlert()
-                    alert.messageText = "Error"
-                    alert.informativeText = "Failed to execute command: \(error.localizedDescription)"
-                    alert.alertStyle = .warning
-                    alert.runModal()
-                }
+            switch await Self.runShellCommand(command) {
+            case .success(let output):
+                guard !output.isEmpty else { return }
+                // Show output in a dialog
+                let alert = NSAlert()
+                alert.messageText = "Command Output"
+                alert.informativeText = output
+                alert.alertStyle = .informational
+                alert.runModal()
+            case .failure(let error):
+                let alert = NSAlert()
+                alert.messageText = "Error"
+                alert.informativeText = "Failed to execute command: \(error.localizedDescription)"
+                alert.alertStyle = .warning
+                alert.runModal()
             }
         }
     }
-    
+
+    /// Runs the command and waits for it off the main thread — waiting on it from the
+    /// main actor froze the whole UI for as long as the command took.
+    @concurrent
+    private nonisolated static func runShellCommand(_ command: String) async -> Result<String, Error> {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        // `-l` (login shell) makes zsh source `~/.zprofile`/`~/.zlogin` the same way
+        // opening Terminal does. Without it, this only gets `/etc/zshenv`'s minimal
+        // PATH — anything installed via Homebrew, pip, etc. (added to PATH in
+        // `~/.zprofile`, the usual place) silently can't be found, since ReFlow itself
+        // was launched by Finder/LaunchServices, not a login shell.
+        process.arguments = ["-l", "-c", command]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        do {
+            try process.run()
+            // Drain the pipe before waiting: a command writing more than the pipe's
+            // buffer (~64 KB) would otherwise block forever waiting for a reader.
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return .success(String(data: data, encoding: .utf8) ?? "")
+        } catch {
+            return .failure(error)
+        }
+    }
+
     private func executeScript(at url: URL) {
         let process = Process()
 
@@ -890,12 +1007,20 @@ class SearchEngine: ObservableObject {
     }
 
     /// A small, cached thumbnail of a sticker's actual image content (its first frame, for
-    /// a GIF) — unlike `icon(for:)`, which asks NSWorkspace for a generic Finder icon by
-    /// file type, this shows what the sticker actually looks like.
+    /// a GIF) — unlike a Finder icon by file type, this shows what the sticker actually
+    /// looks like. Decoded straight to row size (64px, i.e. 32pt on Retina) rather than
+    /// holding every sticker's full-size image or every frame of a GIF in memory.
     private func stickerThumbnail(for fileURL: URL) -> NSImage? {
         let key = fileURL.path
         if let cached = stickerIconCache[key] { return cached }
-        guard let image = NSImage(contentsOf: fileURL) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 64,
+        ]
+        guard let source = CGImageSourceCreateWithURL(fileURL as CFURL, nil),
+              let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        let image = NSImage(cgImage: thumbnail, size: NSSize(width: thumbnail.width / 2, height: thumbnail.height / 2))
         stickerIconCache[key] = image
         return image
     }

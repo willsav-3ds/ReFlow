@@ -18,7 +18,12 @@ class WindowManager {
         case own(NSWindow)
     }
 
-    private init() {}
+    private init() {
+        // AX calls block until the target app answers, and the default timeout is 6
+        // seconds — a hung or busy app could freeze ReFlow (launcher included) for that
+        // long. Set on the system-wide element, this applies to every AX call we make.
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 1.0)
+    }
 
     // MARK: - Window Positioning
 
@@ -294,6 +299,7 @@ class WindowManager {
     private func getFrontmostWindow() -> TileTarget? {
         if !AXIsProcessTrusted() {
             print("ReFlow[tiling]: Accessibility permission not granted — cannot read/move any window.")
+            promptForAccessibility()
             return nil
         }
 
@@ -374,6 +380,19 @@ class WindowManager {
         }
 
         return .accessibility(windows[0])
+    }
+
+    private var lastAccessibilityPrompt = Date.distantPast
+
+    /// Tiling used to fail completely silently without Accessibility access — and an
+    /// update can revoke it without the switch in System Settings visibly turning off,
+    /// since the grant is tied to the exact app signature it was given to. Ask again
+    /// (at most every 30 seconds, so mashing a hotkey doesn't stack up prompts).
+    private func promptForAccessibility() {
+        guard Date().timeIntervalSince(lastAccessibilityPrompt) > 30 else { return }
+        lastAccessibilityPrompt = Date()
+        let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
+        AXIsProcessTrustedWithOptions(options)
     }
 
     /// The screen that actually contains `window`, rather than `NSScreen.main` (which tracks
@@ -482,6 +501,7 @@ class WindowManager {
     /// app yet, the two sets could interleave into a frame neither press asked for.
     private var pendingWindowFrameWork: DispatchWorkItem?
     private static let tileDebounceInterval: TimeInterval = 0.05
+    private var lastTileApplied = Date.distantPast
 
     /// `bounds` is the screen-space area the window must stay inside (the target screen's
     /// `visibleFrame`, i.e. clear of the menu bar and Dock) if it turns out it can't take
@@ -498,9 +518,23 @@ class WindowManager {
             case .own(let nsWindow):
                 self?.applyOwnWindowFrame(nsWindow, frame: screenSpaceFrame, within: bounds)
             }
+            self?.lastTileApplied = Date()
+            // Runs synchronously on the main thread, so no newer press can have been
+            // scheduled meanwhile — whatever's pending is this item, now done.
+            self?.pendingWindowFrameWork = nil
         }
-        pendingWindowFrameWork = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.tileDebounceInterval, execute: workItem)
+        // Only a press that follows closely on another needs coalescing. A lone press
+        // (the common case) applies right away instead of always waiting out the
+        // debounce first.
+        let isBurst = pendingWindowFrameWork != nil
+            || Date().timeIntervalSince(lastTileApplied) < Self.tileDebounceInterval
+        if isBurst {
+            pendingWindowFrameWork = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.tileDebounceInterval, execute: workItem)
+        } else {
+            pendingWindowFrameWork = nil
+            workItem.perform()
+        }
     }
 
     private func applyOwnWindowFrame(_ window: NSWindow, frame screenSpaceFrame: CGRect, within bounds: CGRect) {

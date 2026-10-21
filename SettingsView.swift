@@ -426,6 +426,7 @@ private struct StickersSettingsTab: View {
     /// redraw for some unrelated reason, never reflecting what you copy afterward.
     /// Toggling this on a timer is what actually forces the periodic re-check.
     @State private var clipboardPollTick = false
+    @State private var lastPasteboardChangeCount = NSPasteboard.general.changeCount
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -461,7 +462,12 @@ private struct StickersSettingsTab: View {
             }
         }
         .padding()
-        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+        .onReceive(Timer.publish(every: 1, tolerance: 0.25, on: .main, in: .common).autoconnect()) { _ in
+            // Only re-render when the clipboard actually changed, rather than redrawing
+            // the whole sticker list every second.
+            let changeCount = NSPasteboard.general.changeCount
+            guard changeCount != lastPasteboardChangeCount else { return }
+            lastPasteboardChangeCount = changeCount
             clipboardPollTick.toggle()
         }
     }

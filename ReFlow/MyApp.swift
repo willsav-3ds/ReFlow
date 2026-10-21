@@ -107,6 +107,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // to a private selector that no-ops on newer macOS instead of opening anything.
         LauncherWindowController.shared.prepareContentOffscreen()
 
+        // Scan installed apps in the background now, so the first search doesn't wait.
+        SearchEngine.shared.warmUp()
+
         // Set up global hotkeys, driven by the user's customizable bindings
         HotKeyCenter.shared.handler = { [weak self] action in
             self?.perform(action)

@@ -344,7 +344,7 @@ struct ResultRow: View {
     var body: some View {
         HStack(spacing: 12) {
             // Icon
-            if let icon = result.icon {
+            if let icon = result.icon ?? result.iconPath.map(IconCache.shared.icon(for:)) {
                 Image(nsImage: icon)
                     .resizable()
                     .frame(width: 32, height: 32)

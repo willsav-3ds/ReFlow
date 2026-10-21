@@ -72,6 +72,10 @@ final class ClipboardHistoryStore: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: Self.pollInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.pollPasteboard() }
         }
+        // Lets macOS batch this wake-up with others instead of waking the CPU exactly
+        // on schedule — a big energy saving for a timer that runs all day, and a
+        // quarter-second of slack is invisible for clipboard history.
+        timer?.tolerance = 0.25
     }
 
     private func stopMonitoring() {
