@@ -112,7 +112,8 @@ Open Settings from the menu bar's right-click menu, the launcher's gear icon, or
 - **File Search** — folders searched by File Search mode, default Downloads/Documents/Desktop;
   optionally cap how many files are scanned per folder for speed on very large folders.
 - **Quick Links** — add/remove named shortcuts to a URL, file, or folder.
-- **Stickers** — add custom images/GIFs from a file or directly from the clipboard, for use
+- **Stickers** — add custom images/GIFs from a file or directly from the clipboard (a copied
+  GIF file, a browser's "Copy Image", or a copied `.gif` address all stay animated), for use
   alongside emoji.
 - **Clipboard** — enable/disable Clipboard History and clear it.
 - **Themes** — pick a built-in theme, or create, edit, and delete your own. Appearance and

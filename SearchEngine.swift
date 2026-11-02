@@ -991,7 +991,7 @@ class SearchEngine: ObservableObject {
             let fileURL = StickerStore.shared.fileURL(for: sticker)
             return SearchResult(
                 title: sticker.name,
-                subtitle: "Sticker",
+                subtitle: sticker.isGIF ? "GIF Sticker" : "Sticker",
                 type: .sticker,
                 icon: stickerThumbnail(for: fileURL),
                 systemIcon: "photo",

@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import Combine
+import UniformTypeIdentifiers
 
 /// A user-added custom image/GIF, searchable by name from the emoji picker alongside
 /// built-in emoji, and pasted the same way (see `ClipboardPaste`).
@@ -10,6 +11,26 @@ struct Sticker: Codable, Identifiable, Equatable {
     /// Filename within `StickerStore`'s own storage directory — not the original path
     /// the user added it from, since that file could later move or be deleted.
     var fileName: String
+
+    var isGIF: Bool { fileName.hasSuffix(".gif") }
+}
+
+/// What "Add from Clipboard" found on the pasteboard.
+enum ClipboardStickerContent {
+    /// Raw GIF bytes, stored untouched so the animation survives.
+    case gif(Data)
+    /// Anything else, which gets flattened to PNG.
+    case image(NSImage)
+    /// A web GIF only available by downloading it: browsers' "Copy Image" puts a single
+    /// flattened frame on the clipboard plus the image's address. `fallback` is that
+    /// frame, if there was one, for when the download doesn't work out.
+    case remoteGIF(URL, fallback: NSImage?)
+}
+
+extension Data {
+    /// Sniffs the file signature, since neither a pasteboard type nor a filename is a
+    /// reliable way to tell (a copied file's URL can be an extensionless file reference).
+    var isGIF: Bool { starts(with: Array("GIF8".utf8)) }
 }
 
 extension NSImage {
@@ -24,6 +45,69 @@ extension NSImage {
 }
 
 extension NSPasteboard {
+    /// The single entry point for turning the clipboard into a sticker, trying the
+    /// sources that keep a GIF animated before settling for a still image.
+    func readStickerContent() -> ClipboardStickerContent? {
+        // Has to come first: a file copied in Finder also puts the file's *icon* on the
+        // pasteboard, which every image reader below would happily take for the content.
+        if let fileURL = pasteboardFileURL,
+           let contentType = try? fileURL.resourceValues(forKeys: [.contentTypeKey]).contentType {
+            guard contentType.conforms(to: .image) || contentType.conforms(to: .pdf) else { return nil }
+            if let data = try? Data(contentsOf: fileURL) {
+                if data.isGIF { return .gif(data) }
+                if let image = NSImage(data: data) { return .image(image) }
+            }
+        }
+
+        if let gifData = embeddedGIFData { return .gif(gifData) }
+
+        let stillImage = readEmbeddedImage()
+        if let url = remoteGIFURL(includingHTML: stillImage != nil) {
+            return .remoteGIF(url, fallback: stillImage)
+        }
+        return stillImage.map { .image($0) }
+    }
+
+    /// GIF bytes under any type at all, not just `com.compuserve.gif` (sources can use
+    /// their own), or attached inside RTFD.
+    private var embeddedGIFData: Data? {
+        for type in types ?? [] {
+            if let data = data(forType: type), data.isGIF { return data }
+        }
+
+        guard let rtfdData = data(forType: .rtfd),
+              let attributed = NSAttributedString(rtfd: rtfdData, documentAttributes: nil) else {
+            return nil
+        }
+
+        var foundData: Data?
+        attributed.enumerateAttribute(.attachment, in: NSRange(location: 0, length: attributed.length)) { value, _, stop in
+            guard let attachment = value as? NSTextAttachment,
+                  let data = attachment.fileWrapper?.regularFileContents ?? attachment.contents,
+                  data.isGIF else { return }
+            foundData = data
+            stop.pointee = true
+        }
+        return foundData
+    }
+
+    /// The address of a GIF the clipboard points at: a copied link or image address, or
+    /// the `<img>` a browser's "Copy Image" writes as HTML. The HTML is only trusted when
+    /// an actual image came with it — copying ordinary page text also produces HTML, and
+    /// its first `.gif` could just be a spacer or tracking pixel.
+    private func remoteGIFURL(includingHTML: Bool) -> URL? {
+        var candidates = [string(forType: .URL), string(forType: .string)].compactMap { $0 }
+        if includingHTML, let html = string(forType: .html),
+           let regex = try? Regex(#"<img[^>]+src\s*=\s*["']([^"']+)["']"#).ignoresCase(),
+           let source = html.firstMatch(of: regex)?.output[1].substring {
+            candidates.append(source.replacingOccurrences(of: "&amp;", with: "&"))
+        }
+
+        return candidates.lazy
+            .compactMap { URL(string: $0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            .first { ["http", "https"].contains($0.scheme?.lowercased()) && $0.pathExtension.lowercased() == "gif" }
+    }
+
     /// Everything `canReadObject`/`readObjects(forClasses: [NSImage.self])` misses: apps
     /// that copy an image wrapped in RTFD (rich text with an embedded attachment)
     /// instead of putting a bare image type on the pasteboard. Falls back to pulling the
@@ -147,6 +231,17 @@ final class StickerStore: ObservableObject {
         stickers.append(Sticker(name: name, fileName: destinationFileName))
         persist()
         return true
+    }
+
+    /// Fetches a GIF found by `readStickerContent`. Returns `nil` for anything that isn't
+    /// actually a GIF once downloaded, such as a host's error page.
+    func downloadGIF(from url: URL) async -> Data? {
+        let request = URLRequest(url: url, timeoutInterval: 15)
+        guard let (data, _) = try? await URLSession.shared.data(for: request), data.isGIF else {
+            print("ReFlow[stickers]: could not download a GIF from \(url.absoluteString).")
+            return nil
+        }
+        return data
     }
 
     func remove(_ sticker: Sticker) {

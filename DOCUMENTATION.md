@@ -45,7 +45,7 @@ WindowManager — AX-based window tiling, invoked directly by AppDelegate.perfor
 | `RankingStore.swift` | Persists per-item usage counts and turns them into a small relevance boost |
 | `QuickLinkStore.swift` | `QuickLink` model + persisted store; `QuickLinkStore.open(_:)` opens a URL or filesystem path |
 | `ClipboardPaste.swift` | The paste mechanism: snapshot the pasteboard → set new contents → reactivate the previously-frontmost app → simulate `⌘V` → restore the original pasteboard |
-| `StickerStore.swift` | `Sticker` model + persisted store; copies added images/GIFs into Application Support; `NSImage.pngData()` and `NSPasteboard.readEmbeddedImage()` helpers |
+| `StickerStore.swift` | `Sticker` model + persisted store; copies added images/GIFs into Application Support; `NSImage.pngData()` and `NSPasteboard.readStickerContent()` helpers (keeps GIFs animated, downloading a browser-copied GIF from its address if needed) |
 | `ClipboardHistoryStore.swift` | Opt-in, in-memory-only clipboard history via pasteboard `changeCount` polling |
 | `CalculatorEngine.swift` | Hand-rolled recursive-descent arithmetic parser/evaluator backing the inline calculator |
 | `EmojiDatabase.swift` | Hardcoded emoji + keyword list, searched the same way as everything else |
@@ -257,6 +257,8 @@ actually copy themselves.
 - Messages' "Copy" on a photo bubble doesn't reliably produce an image
   `NSPasteboard.readEmbeddedImage()` can extract, even though the same clipboard contents
   paste fine as an image into apps like Notes (`StickerStore.swift`).
+- Only real GIF files stay animated as stickers. Other animated formats, such as the animated
+  WebP some GIF sites serve, are stored as a still image.
 - `EmojiDatabase` is a small hardcoded list, not the full Unicode emoji set.
 - Window tiling requires Accessibility permission and will no-op (with a logged reason) for
   windows that don't expose settable AX position/size, such as native full-screen windows.

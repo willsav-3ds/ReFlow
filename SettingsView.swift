@@ -427,15 +427,15 @@ private struct QuickLinksSettingsTab: View {
 private struct StickersSettingsTab: View {
     @ObservedObject private var store = StickerStore.shared
     @State private var newName = ""
-    /// `clipboardHasImage` is a plain computed property, so SwiftUI only re-checks it
-    /// when the view's body re-renders — which normally only happens in response to a
-    /// `@State`/`@Published` change. Copying something in another app happens entirely
-    /// outside this view's observed state, so without this the button's enabled state
-    /// would freeze at whatever the clipboard held the last time this view happened to
-    /// redraw for some unrelated reason, never reflecting what you copy afterward.
-    /// Toggling this on a timer is what actually forces the periodic re-check.
-    @State private var clipboardPollTick = false
+    /// Cached rather than computed in `body`, and refreshed by the timer below when the
+    /// clipboard changes: copying something in another app happens entirely outside this
+    /// view's observed state, and there's no notification for it. Reading this in `body`
+    /// is also what makes the refresh redraw the button — SwiftUI ignores changes to
+    /// `@State` that `body` never reads.
+    @State private var clipboardHasImage = false
     @State private var lastPasteboardChangeCount = NSPasteboard.general.changeCount
+    @State private var isDownloadingGIF = false
+    @State private var statusMessage: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -448,6 +448,12 @@ private struct StickersSettingsTab: View {
                     HStack {
                         StickerThumbnail(fileURL: store.fileURL(for: sticker))
                         Text(sticker.name)
+
+                        if sticker.isGIF {
+                            Text("GIF")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
 
                         Spacer()
 
@@ -462,34 +468,38 @@ private struct StickersSettingsTab: View {
             }
             .listStyle(.inset)
 
+            if let statusMessage {
+                Text(statusMessage)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
             HStack(spacing: 8) {
                 TextField("Name (optional)", text: $newName)
                 Spacer()
+                if isDownloadingGIF {
+                    ProgressView()
+                        .controlSize(.small)
+                }
                 Button("Add from Clipboard", action: addStickerFromClipboard)
-                    .disabled(!clipboardHasImage)
+                    .disabled(!clipboardHasImage || isDownloadingGIF)
                 Button("Add Sticker…", action: addSticker)
             }
         }
         .padding()
+        .onAppear(perform: refreshClipboardState)
         .onReceive(Timer.publish(every: 1, tolerance: 0.25, on: .main, in: .common).autoconnect()) { _ in
-            // Only re-render when the clipboard actually changed, rather than redrawing
-            // the whole sticker list every second.
-            let changeCount = NSPasteboard.general.changeCount
-            guard changeCount != lastPasteboardChangeCount else { return }
-            lastPasteboardChangeCount = changeCount
-            clipboardPollTick.toggle()
+            // Only re-check when the clipboard actually changed: the check decodes
+            // whatever's on it, which isn't something to redo every second.
+            guard NSPasteboard.general.changeCount != lastPasteboardChangeCount else { return }
+            refreshClipboardState()
         }
     }
 
-    /// Whether the clipboard currently holds something `addStickerFromClipboard` could
-    /// actually use — checked on every body re-render rather than cached, since there's
-    /// no notification for "the clipboard changed" to invalidate a cache against.
-    private var clipboardHasImage: Bool {
+    private func refreshClipboardState() {
         let pasteboard = NSPasteboard.general
-        if pasteboard.data(forType: NSPasteboard.PasteboardType("com.compuserve.gif")) != nil { return true }
-        // `readEmbeddedImage` covers both a direct image type (HEIC, JPEG, PDF, etc.)
-        // and an image wrapped in RTFD — how Messages in particular copies pictures.
-        return pasteboard.readEmbeddedImage() != nil
+        lastPasteboardChangeCount = pasteboard.changeCount
+        clipboardHasImage = pasteboard.readStickerContent() != nil
     }
 
     private func addSticker() {
@@ -510,35 +520,62 @@ private struct StickersSettingsTab: View {
     }
 
     private func addStickerFromClipboard() {
-        let pasteboard = NSPasteboard.general
         let name = newName.trimmingCharacters(in: .whitespaces).isEmpty
             ? "Sticker"
             : newName.trimmingCharacters(in: .whitespaces)
+        statusMessage = nil
 
-        // Keep an actual GIF as-is so its animation survives. For everything else, a
-        // direct image type (HEIC, JPEG, PDF, ...) or one wrapped in RTFD —
-        // `readEmbeddedImage` decodes it and we flatten the result to PNG, so stickers
-        // always end up in one predictable, widely-supported format rather than
-        // whatever the source app happened to put on the clipboard.
-        if let gifData = pasteboard.data(forType: NSPasteboard.PasteboardType("com.compuserve.gif")) {
-            store.add(name: name, data: gifData, fileExtension: "gif")
-        } else if let image = pasteboard.readEmbeddedImage(),
-                  let pngData = image.pngData() {
-            store.add(name: name, data: pngData, fileExtension: "png")
-        } else {
+        // Keep an actual GIF as-is so its animation survives. Everything else gets
+        // flattened to PNG, so stickers always end up in one predictable, widely-supported
+        // format rather than whatever the source app happened to put on the clipboard.
+        switch NSPasteboard.general.readStickerContent() {
+        case .gif(let data):
+            finishAdding(store.add(name: name, data: data, fileExtension: "gif"))
+        case .image(let image):
+            addStill(image, name: name)
+        case .remoteGIF(let url, let fallback):
+            isDownloadingGIF = true
+            Task {
+                let data = await store.downloadGIF(from: url)
+                isDownloadingGIF = false
+                if let data {
+                    finishAdding(store.add(name: name, data: data, fileExtension: "gif"))
+                } else if let fallback {
+                    addStill(fallback, name: name)
+                    statusMessage = "Couldn't download the animated GIF, so this was added as a still image."
+                } else {
+                    statusMessage = "Couldn't download that GIF."
+                }
+            }
+        case nil:
+            statusMessage = "Couldn't read an image from the clipboard."
+        }
+    }
+
+    private func addStill(_ image: NSImage, name: String) {
+        guard let pngData = image.pngData() else {
+            statusMessage = "Couldn't read an image from the clipboard."
             return
         }
-        newName = ""
+        finishAdding(store.add(name: name, data: pngData, fileExtension: "png"))
+    }
+
+    private func finishAdding(_ succeeded: Bool) {
+        if succeeded {
+            newName = ""
+        } else {
+            statusMessage = "Couldn't save the sticker."
+        }
     }
 }
 
 private struct StickerThumbnail: View {
     let fileURL: URL
     /// Loaded once in `.onAppear` rather than decoded straight in `body`: the parent tab
-    /// re-renders every second (its clipboard-polling timer), and without this, every
-    /// thumbnail in the list would re-read and re-decode its file from disk on every one
-    /// of those tics for as long as the Stickers tab is open — sticker files never change
-    /// after being added, so there's nothing to gain from redoing that work.
+    /// re-renders whenever the clipboard changes or the name field is edited, and without
+    /// this, every thumbnail in the list would re-read and re-decode its file from disk
+    /// each time — sticker files never change after being added, so there's nothing to
+    /// gain from redoing that work.
     @State private var image: NSImage?
 
     var body: some View {
