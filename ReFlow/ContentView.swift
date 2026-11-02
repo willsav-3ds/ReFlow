@@ -5,6 +5,7 @@ struct LauncherView: View {
     @ObservedObject private var searchEngine = SearchEngine.shared
     @ObservedObject private var shortcuts = ShortcutStore.shared
     @ObservedObject private var windowController = LauncherWindowController.shared
+    @ObservedObject private var themes = ThemeStore.shared
     @State private var searchText = ""
     @State private var launcherKeyMonitor: Any?
     @FocusState private var isSearchFieldFocused: Bool
@@ -70,7 +71,7 @@ struct LauncherView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(Array(searchEngine.results.enumerated()), id: \.element.id) { index, result in
-                            ResultRow(result: result, isSelected: index == searchEngine.selectedIndex)
+                            ResultRow(result: result, isSelected: index == searchEngine.selectedIndex, accent: themes.accentColor)
                                 .id(result.id)
                                 .contentShape(Rectangle())
                                 // Files open on click like every other result. This used to
@@ -125,7 +126,8 @@ struct LauncherView: View {
                 }
             }
         }
-        .background(.regularMaterial)
+        .background(ThemeBackground(theme: themes.activeTheme))
+        .tint(themes.accentColor)
         .frame(width: 600, height: 450)
         .onChange(of: searchText) { _, newValue in
             searchEngine.search(query: newValue)
@@ -339,6 +341,7 @@ private struct FileDragSource: ViewModifier {
 struct ResultRow: View {
     let result: SearchResult
     let isSelected: Bool
+    let accent: Color
     @State private var isHovering = false
     
     var body: some View {
@@ -386,13 +389,13 @@ struct ResultRow: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(
-            isHovering ? Color.accentColor.opacity(0.1) :
-            isSelected ? Color.accentColor.opacity(0.15) : Color.clear
+            isHovering ? accent.opacity(0.1) :
+            isSelected ? accent.opacity(0.15) : Color.clear
         )
         .overlay(alignment: .leading) {
             if isSelected {
                 Rectangle()
-                    .fill(Color.accentColor)
+                    .fill(accent)
                     .frame(width: 3)
             }
         }

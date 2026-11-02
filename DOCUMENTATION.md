@@ -40,7 +40,8 @@ WindowManager — AX-based window tiling, invoked directly by AppDelegate.perfor
 | `SearchResult.swift` | `SearchResult` model and `ResultType` enum shown in the results list |
 | `WindowManager.swift` | `WindowManager` singleton: all window-tiling geometry plus the Accessibility-API plumbing to read/move the frontmost window |
 | `Shortcuts.swift` | `KeyBinding`, `ShortcutAction` (every bindable action, its scope/section/display name/default), `ShortcutStore` (persisted bindings + conflict detection), `HotKeyCenter` (Carbon global-hotkey registration) |
-| `SettingsView.swift` | The `Settings` scene: one tab per feature area (Shortcuts, Scripts, File Search, Quick Links, Stickers, Clipboard) |
+| `SettingsView.swift` | The `Settings` scene: one tab per feature area (Shortcuts, Scripts, File Search, Quick Links, Stickers, Clipboard, Themes) |
+| `ThemeStore.swift` | `Theme` model, built-in themes, persisted custom themes and active theme; applies appearance through `NSApp.appearance`; `ThemeBackground` (the launcher's backdrop) |
 | `RankingStore.swift` | Persists per-item usage counts and turns them into a small relevance boost |
 | `QuickLinkStore.swift` | `QuickLink` model + persisted store; `QuickLinkStore.open(_:)` opens a URL or filesystem path |
 | `ClipboardPaste.swift` | The paste mechanism: snapshot the pasteboard → set new contents → reactivate the previously-frontmost app → simulate `⌘V` → restore the original pasteboard |
@@ -52,7 +53,7 @@ WindowManager — AX-based window tiling, invoked directly by AppDelegate.perfor
 ## Singletons vs. `@State`
 
 Nearly every store (`SearchEngine`, `ShortcutStore`, `QuickLinkStore`, `StickerStore`,
-`ClipboardHistoryStore`, `RankingStore`, `WindowManager`, `HotKeyCenter`,
+`ClipboardHistoryStore`, `RankingStore`, `ThemeStore`, `WindowManager`, `HotKeyCenter`,
 `LauncherWindowController`) is a `static let shared` singleton rather than a view-owned
 `@StateObject`. This is deliberate: several of these need to be reached from pure-AppKit code
 that has no SwiftUI view hierarchy of its own (the status item's right-click menu, the global
@@ -168,6 +169,20 @@ private API:
 All tiling failures are logged to stderr with the `ReFlow[tiling]:` prefix rather than failing
 silently, to make diagnosing a misbehaving target app possible.
 
+### Moving windows between desktops
+
+There's no public API for moving a window to another Space, so
+`moveActiveWindowToAdjacentDesktop` simulates the manual gesture with `CGEvent`s: mouse down
+just right of the zoom button (a fixed offset from the corner if the window reports none),
+a small drag so the window is actually held, `⌃←`/`⌃→`, a wait for the switch animation,
+then the drag undone, mouse up, and the cursor put back. Steps run through `asyncAfter` so
+the main thread stays free, and `isMovingBetweenDesktops` drops presses made mid-sequence.
+
+It first waits up to 0.6s for the hotkey's modifiers to be released, since a click with `⌃`
+held is a right-click. The events also set their flags explicitly, for anyone still holding
+them after that. Native full-screen windows are skipped, because the `⌃`-arrow would switch
+desktops without taking the window along.
+
 ## Shortcuts
 
 - `KeyBinding` wraps a key code + modifier flags, masked to just control/option/shift/command
@@ -217,6 +232,7 @@ actually copy themselves.
 |---|---|---|
 | `ShortcutStore` | `UserDefaults` (JSON) | Self-healing on load; see above |
 | `QuickLinkStore` | `UserDefaults` (JSON) | |
+| `ThemeStore` | `UserDefaults` (`customThemes` as JSON, `activeThemeID`) | Built-in themes live in code; an unknown active ID falls back to the default theme |
 | `StickerStore` | `UserDefaults` (JSON metadata) + files in `~/Library/Application Support/ReFlow/Stickers/` | Images are copied in, not referenced by original path, so they survive the source file moving/being deleted |
 | `RankingStore` | `UserDefaults` (dictionary) | Keyed by `rankingKey`; capped boost per item |
 | `ClipboardHistoryStore` | **In-memory only** | Never persisted; cleared on disable or quit, by design (clipboard contents can include secrets) |
@@ -244,3 +260,6 @@ actually copy themselves.
 - `EmojiDatabase` is a small hardcoded list, not the full Unicode emoji set.
 - Window tiling requires Accessibility permission and will no-op (with a logged reason) for
   windows that don't expose settable AX position/size, such as native full-screen windows.
+- Moving a window between desktops needs the system's "Move left/right a space" shortcuts
+  enabled, and clicks blindly beside the zoom button, so a control placed there in an unusual
+  title bar would receive the click.

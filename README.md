@@ -30,8 +30,10 @@ across displays.
   contents. Kept in memory only, never written to disk, and cleared whenever it's turned off
   or ReFlow quits.
 - **Window tiling** — snap the active window to halves, corners, thirds, two-thirds, or
-  maximize/center it, and move it between displays — all via global hotkeys, no launcher
-  needed.
+  maximize/center it, and move it between displays or desktops — all via global hotkeys, no
+  launcher needed.
+- **Themes** — switch the launcher and Settings between built-in themes, or create your own
+  with a custom appearance, accent color, and launcher background.
 - **Fully customizable shortcuts** — every action has a default binding but can be
   re-recorded in Settings, with conflict detection per scope.
 - **Quick Links** — name a URL, file, or folder once in Settings and find it by name from the
@@ -90,8 +92,14 @@ All tiling shortcuts default to Magnet's scheme: `⌃⌥` (Control+Option) plus 
 | Left / Center / Right third | `⌃⌥D` / `⌃⌥F` / `⌃⌥G` |
 | Left / Right two-thirds | `⌃⌥E` / `⌃⌥T` |
 | Previous / Next display | `⌃⌥⌘←` / `⌃⌥⌘→` |
+| Previous / Next desktop | `⌃⌥⇧←` / `⌃⌥⇧→` |
 
 All of the above — plus every launcher shortcut — can be changed in **Settings → Shortcuts**.
+
+Moving a window to another desktop simulates holding its title bar and pressing `⌃←` or `⌃→`,
+so "Move left a space" and "Move right a space" must stay enabled in System Settings →
+Keyboard → Keyboard Shortcuts → Mission Control (they are by default). Your cursor briefly
+jumps to the window and returns. It doesn't work on full-screen windows.
 
 ## Settings
 
@@ -107,6 +115,8 @@ Open Settings from the menu bar's right-click menu, the launcher's gear icon, or
 - **Stickers** — add custom images/GIFs from a file or directly from the clipboard, for use
   alongside emoji.
 - **Clipboard** — enable/disable Clipboard History and clear it.
+- **Themes** — pick a built-in theme, or create, edit, and delete your own. Appearance and
+  accent color apply to the launcher and Settings; the background applies to the launcher.
 
 ## Privacy
 

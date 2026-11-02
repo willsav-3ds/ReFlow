@@ -4,6 +4,8 @@ import UniformTypeIdentifiers
 import Combine
 
 struct SettingsView: View {
+    @ObservedObject private var themes = ThemeStore.shared
+
     var body: some View {
         TabView {
             ShortcutsSettingsTab()
@@ -35,8 +37,14 @@ struct SettingsView: View {
                 .tabItem {
                     Label("Clipboard", systemImage: "doc.on.clipboard")
                 }
+
+            ThemesSettingsTab()
+                .tabItem {
+                    Label("Themes", systemImage: "paintpalette")
+                }
         }
-        .frame(width: 520, height: 420)
+        .frame(width: 600, height: 460)
+        .tint(themes.accentColor)
         .background(SettingsWindowAccessor())
     }
 }
@@ -140,6 +148,7 @@ private struct ShortcutRecorder: View {
     let binding: KeyBinding
     let onCapture: (KeyBinding) -> Void
 
+    @ObservedObject private var themes = ThemeStore.shared
     @State private var isRecording = false
     @State private var monitor: Any?
 
@@ -149,7 +158,7 @@ private struct ShortcutRecorder: View {
                 .frame(minWidth: 110)
                 .padding(.horizontal, 6)
                 .padding(.vertical, 3)
-                .background(isRecording ? Color.accentColor.opacity(0.2) : Color.secondary.opacity(0.15))
+                .background(isRecording ? themes.accentColor.opacity(0.2) : Color.secondary.opacity(0.15))
                 .clipShape(RoundedRectangle(cornerRadius: 6))
         }
         .buttonStyle(.plain)
@@ -582,6 +591,241 @@ private struct ClipboardSettingsTab: View {
             Spacer()
         }
         .padding()
+    }
+}
+
+// MARK: - Themes Tab
+
+private struct ThemesSettingsTab: View {
+    @ObservedObject private var store = ThemeStore.shared
+
+    /// Selecting a row is what activates a theme, so the list's selection *is* the active theme.
+    private var selection: Binding<UUID?> {
+        Binding(
+            get: { store.activeThemeID },
+            set: { id in
+                if let id { store.activate(id) }
+            }
+        )
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 16) {
+            VStack(alignment: .leading, spacing: 8) {
+                List(selection: selection) {
+                    Section("Built-In") {
+                        ForEach(ThemeStore.builtInThemes) { theme in
+                            ThemeListRow(theme: theme)
+                        }
+                    }
+                    if !store.customThemes.isEmpty {
+                        Section("Custom") {
+                            ForEach(store.customThemes) { theme in
+                                ThemeListRow(theme: theme)
+                            }
+                        }
+                    }
+                }
+                .listStyle(.inset)
+
+                HStack(spacing: 8) {
+                    Button {
+                        store.duplicateActiveTheme()
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                    .help("Create a new theme from the selected one")
+
+                    Button {
+                        store.remove(store.activeThemeID)
+                    } label: {
+                        Image(systemName: "minus")
+                    }
+                    .disabled(store.isActiveThemeBuiltIn)
+                    .help("Delete the selected theme")
+                }
+            }
+            .frame(width: 180)
+
+            ThemeEditor(store: store)
+        }
+        .padding()
+    }
+}
+
+private struct ThemeListRow: View {
+    let theme: Theme
+
+    var body: some View {
+        HStack {
+            ThemeSwatch(theme: theme)
+            Text(theme.displayName)
+                .lineLimit(1)
+        }
+        .tag(theme.id)
+    }
+}
+
+private struct ThemeSwatch: View {
+    let theme: Theme
+
+    var body: some View {
+        Circle()
+            .fill(theme.background?.color ?? Color.secondary.opacity(0.3))
+            .overlay {
+                Circle()
+                    .fill(theme.accent?.color ?? Color.accentColor)
+                    .padding(4)
+            }
+            .frame(width: 16, height: 16)
+    }
+}
+
+private struct ThemeEditor: View {
+    @ObservedObject var store: ThemeStore
+
+    /// A binding to one field of the active theme, saving every change as it's made.
+    private func field<Value>(_ keyPath: WritableKeyPath<Theme, Value>) -> Binding<Value> {
+        Binding(
+            get: { store.activeTheme[keyPath: keyPath] },
+            set: { newValue in
+                var theme = store.activeTheme
+                theme[keyPath: keyPath] = newValue
+                store.update(theme)
+            }
+        )
+    }
+
+    /// Bridges an optional stored color to a toggle: on starts from `fallback`, off clears it.
+    private func isEnabled(_ keyPath: WritableKeyPath<Theme, ThemeColor?>, fallback: NSColor) -> Binding<Bool> {
+        Binding(
+            get: { store.activeTheme[keyPath: keyPath] != nil },
+            set: { enabled in
+                field(keyPath).wrappedValue = enabled ? ThemeColor(fallback) : nil
+            }
+        )
+    }
+
+    /// Bridges a stored color to `ColorPicker`, which only speaks SwiftUI's `Color`.
+    private func pickerColor(_ keyPath: WritableKeyPath<Theme, ThemeColor?>) -> Binding<Color> {
+        Binding(
+            get: { store.activeTheme[keyPath: keyPath]?.color ?? .clear },
+            set: { newColor in
+                if let color = ThemeColor(NSColor(newColor)) {
+                    field(keyPath).wrappedValue = color
+                }
+            }
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ThemePreview(theme: store.activeTheme, accent: store.accentColor)
+
+            if store.isActiveThemeBuiltIn {
+                HStack {
+                    Text("Built-in themes can't be edited.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Duplicate to Customize") {
+                        store.duplicateActiveTheme()
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 12) {
+                TextField("Name", text: field(\.name))
+
+                Picker("Appearance", selection: field(\.appearance)) {
+                    ForEach(ThemeAppearance.allCases) { appearance in
+                        Text(appearance.displayName).tag(appearance)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                HStack {
+                    Toggle("Custom accent color", isOn: isEnabled(\.accent, fallback: .controlAccentColor))
+                    Spacer()
+                    if store.activeTheme.accent != nil {
+                        ColorPicker("Accent color", selection: pickerColor(\.accent), supportsOpacity: false)
+                            .labelsHidden()
+                    }
+                }
+
+                HStack {
+                    Toggle("Custom launcher background", isOn: isEnabled(\.background, fallback: .windowBackgroundColor))
+                    Spacer()
+                    if store.activeTheme.background != nil {
+                        ColorPicker("Launcher background", selection: pickerColor(\.background), supportsOpacity: false)
+                            .labelsHidden()
+                    }
+                }
+
+                if store.activeTheme.background != nil {
+                    HStack {
+                        Text("Opacity")
+                        Slider(value: field(\.backgroundOpacity), in: 0.2...1)
+                    }
+                }
+            }
+            .disabled(store.isActiveThemeBuiltIn)
+
+            Spacer()
+        }
+    }
+}
+
+/// A miniature launcher showing what the selected theme looks like.
+private struct ThemePreview: View {
+    let theme: Theme
+    let accent: Color
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                Text("Search…")
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(10)
+
+            Divider()
+
+            HStack(spacing: 8) {
+                Image(systemName: "app.fill")
+                    .foregroundStyle(.secondary)
+                Text("Selected result")
+                    .font(.system(size: 13, weight: .medium))
+                Spacer()
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(accent.opacity(0.15))
+            .overlay(alignment: .leading) {
+                Rectangle()
+                    .fill(accent)
+                    .frame(width: 3)
+            }
+
+            HStack(spacing: 8) {
+                Image(systemName: "doc.fill")
+                    .foregroundStyle(.secondary)
+                Text("Another result")
+                    .font(.system(size: 13, weight: .medium))
+                Spacer()
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+        }
+        .background(ThemeBackground(theme: theme))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.secondary.opacity(0.3))
+        }
     }
 }
 

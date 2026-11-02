@@ -294,6 +294,159 @@ class WindowManager {
         setWindowFrame(window, frame: newFrame, within: targetScreen.visibleFrame)
     }
 
+    // MARK: - Desktops
+
+    func moveActiveWindowToPreviousDesktop() {
+        moveActiveWindowToAdjacentDesktop(arrowKeyCode: 123) // Left
+    }
+
+    func moveActiveWindowToNextDesktop() {
+        moveActiveWindowToAdjacentDesktop(arrowKeyCode: 124) // Right
+    }
+
+    /// True from the simulated mouse-down until the matching mouse-up has been posted, so a
+    /// second press can't start another sequence on top of a window that's still held.
+    private var isMovingBetweenDesktops = false
+
+    /// There's no public API for moving a window to another Space, so this does what you'd
+    /// do by hand: hold the window by its title bar and press ⌃← or ⌃→, which carries the
+    /// held window along when macOS switches desktops. That means it relies on the "Move
+    /// left/right a space" shortcuts being enabled in System Settings (they are by default).
+    private func moveActiveWindowToAdjacentDesktop(arrowKeyCode: CGKeyCode) {
+        guard !isMovingBetweenDesktops else { return }
+        guard let window = getFrontmostWindow() else { return }
+
+        // A full-screen window is its own Space and can't be dragged, so the ⌃-arrow would
+        // switch desktops and leave the window behind.
+        if case .accessibility(let axWindow) = window, isFullScreen(axWindow) {
+            print("ReFlow[desktops]: window is in native full screen — can't move it to another desktop.")
+            return
+        }
+        guard let grabPoint = titleBarGrabPoint(of: window) else {
+            print("ReFlow[desktops]: window's title bar isn't on any screen — can't grab it.")
+            return
+        }
+
+        isMovingBetweenDesktops = true
+        whenModifiersReleased(deadline: Date().addingTimeInterval(0.6)) { [weak self] in
+            self?.performDesktopMove(grabPoint: grabPoint, arrowKeyCode: arrowKeyCode)
+        }
+    }
+
+    /// The hotkey's own modifiers are usually still physically down when it fires, and a
+    /// click with ⌃ held is a right-click. Waiting for them to come up (checking every 10ms)
+    /// avoids that; the deadline keeps someone holding them from stalling the move, with
+    /// the explicit event flags in `performDesktopMove` covering that case.
+    private func whenModifiersReleased(deadline: Date, _ body: @escaping () -> Void) {
+        let held = CGEventSource.flagsState(.hidSystemState)
+            .intersection([.maskControl, .maskAlternate, .maskShift, .maskCommand])
+        guard !held.isEmpty, Date() < deadline else {
+            body()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in
+            self?.whenModifiersReleased(deadline: deadline, body)
+        }
+    }
+
+    private func performDesktopMove(grabPoint: CGPoint, arrowKeyCode: CGKeyCode) {
+        let source = CGEventSource(stateID: .privateState)
+        let originalCursorLocation = CGEvent(source: nil)?.location
+
+        func postMouse(_ type: CGEventType, at point: CGPoint) {
+            guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: .left) else { return }
+            event.flags = []
+            // Always a single click, so repeating the shortcut quickly can't register as a
+            // double-click on the title bar, which would zoom or minimize the window.
+            if type != .mouseMoved {
+                event.setIntegerValueField(.mouseEventClickState, value: 1)
+            }
+            event.post(tap: .cghidEventTap)
+        }
+
+        // Real arrow-key events carry the function and numeric-pad flags too, and the
+        // system's Space-switching shortcut is registered with the function flag included.
+        func postArrow(keyDown: Bool) {
+            guard let event = CGEvent(keyboardEventSource: source, virtualKey: arrowKeyCode, keyDown: keyDown) else { return }
+            event.flags = [.maskControl, .maskSecondaryFn, .maskNumericPad]
+            event.post(tap: .cghidEventTap)
+        }
+
+        // A plain mouse-down isn't always treated as holding the window — it takes actual
+        // movement. The offset is undone before letting go, so the window lands where it was.
+        let draggedPoint = CGPoint(x: grabPoint.x + 4, y: grabPoint.y)
+
+        let steps: [(delay: TimeInterval, action: () -> Void)] = [
+            (0, { postMouse(.mouseMoved, at: grabPoint) }),
+            (0.03, { postMouse(.leftMouseDown, at: grabPoint) }),
+            (0.08, { postMouse(.leftMouseDragged, at: draggedPoint) }),
+            (0.06, { postArrow(keyDown: true) }),
+            (0.03, { postArrow(keyDown: false) }),
+            // Long enough for the desktop-switch animation, so the window is still held
+            // when it finishes rather than getting dropped on the desktop being left.
+            (0.45, { postMouse(.leftMouseDragged, at: grabPoint) }),
+            (0.03, { postMouse(.leftMouseUp, at: grabPoint) }),
+            (0.03, { [weak self] in
+                if let originalCursorLocation {
+                    postMouse(.mouseMoved, at: originalCursorLocation)
+                }
+                self?.isMovingBetweenDesktops = false
+            }),
+        ]
+        runSteps(steps[...])
+    }
+
+    /// Runs each step after its delay without blocking the main thread: ReFlow has to stay
+    /// responsive throughout, and a step skipped here could leave the mouse button held down.
+    private func runSteps(_ steps: ArraySlice<(delay: TimeInterval, action: () -> Void)>) {
+        guard let step = steps.first else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + step.delay) { [self] in
+            step.action()
+            runSteps(steps.dropFirst())
+        }
+    }
+
+    private func isFullScreen(_ window: AXUIElement) -> Bool {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, "AXFullScreen" as CFString, &value) == .success else { return false }
+        return (value as? Bool) == true
+    }
+
+    /// A point in the window's title bar that's safe to click, in the AX/CoreGraphics
+    /// coordinate space mouse events use. Just right of the zoom button is the most reliable
+    /// empty spot: the middle of the title bar is often a tab or toolbar control in apps
+    /// like browsers, where a click would do something else. Falls back to a fixed offset
+    /// from the corner for windows that don't report a zoom button.
+    private func titleBarGrabPoint(of target: TileTarget) -> CGPoint? {
+        let frame: CGRect
+        var zoomButtonFrame: CGRect?
+        switch target {
+        case .accessibility(let window):
+            guard let windowFrame = getWindowFrame(window) else { return nil }
+            frame = windowFrame
+            var zoomButton: CFTypeRef?
+            if AXUIElementCopyAttributeValue(window, kAXZoomButtonAttribute as CFString, &zoomButton) == .success,
+               let zoomButton {
+                zoomButtonFrame = getWindowFrame(zoomButton as! AXUIElement)
+            }
+        case .own(let window):
+            frame = axFrame(fromScreenSpace: window.frame)
+        }
+
+        var point = CGPoint(x: frame.minX + 80, y: frame.minY + 14)
+        if let zoomButtonFrame {
+            let besideZoomButton = CGPoint(x: zoomButtonFrame.maxX + 6, y: zoomButtonFrame.midY)
+            if frame.contains(besideZoomButton) {
+                point = besideZoomButton
+            }
+        }
+
+        // Flipped only to check it against `NSScreen`, as a zero-size rect at the point.
+        let screenSpacePoint = screenSpaceFrame(fromAX: CGRect(origin: point, size: .zero)).origin
+        guard NSScreen.screens.contains(where: { $0.frame.contains(screenSpacePoint) }) else { return nil }
+        return point
+    }
+
     // MARK: - Helper Methods
 
     private func getFrontmostWindow() -> TileTarget? {

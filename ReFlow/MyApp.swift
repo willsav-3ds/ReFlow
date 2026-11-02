@@ -78,6 +78,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Request accessibility permissions
         requestAccessibilityPermissions()
 
+        ThemeStore.shared.applyAppearance()
+
         // Create status bar item
         statusBarItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusBarItem.button {
@@ -158,6 +160,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             windowManager.moveActiveWindowToPreviousDisplay()
         case .displayNext:
             windowManager.moveActiveWindowToNextDisplay()
+        case .desktopPrevious:
+            // The launcher floats above everything, so if it's open over the target window
+            // the simulated title bar click would land on the launcher instead.
+            LauncherWindowController.shared.hide()
+            windowManager.moveActiveWindowToPreviousDesktop()
+        case .desktopNext:
+            LauncherWindowController.shared.hide()
+            windowManager.moveActiveWindowToNextDesktop()
         case .toggleEmojiMode:
             LauncherWindowController.shared.showEmojiPicker()
         case .trashTopResult, .moveTopResult, .showInFinderTopResult, .openSettings:

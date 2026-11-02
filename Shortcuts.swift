@@ -102,6 +102,8 @@ enum ShortcutAction: String, CaseIterable, Codable {
     case windowRightTwoThirds
     case displayPrevious
     case displayNext
+    case desktopPrevious
+    case desktopNext
     case toggleEmojiMode
     case trashTopResult
     case moveTopResult
@@ -135,6 +137,8 @@ enum ShortcutAction: String, CaseIterable, Codable {
             return "Thirds"
         case .displayPrevious, .displayNext:
             return "Displays"
+        case .desktopPrevious, .desktopNext:
+            return "Desktops"
         case .toggleEmojiMode, .trashTopResult, .moveTopResult, .showInFinderTopResult, .openSettings:
             return "Launcher"
         }
@@ -160,6 +164,8 @@ enum ShortcutAction: String, CaseIterable, Codable {
         case .windowRightTwoThirds: return "Snap Window Right Two-Thirds"
         case .displayPrevious: return "Move Window to Previous Display"
         case .displayNext: return "Move Window to Next Display"
+        case .desktopPrevious: return "Move Window to Previous Desktop"
+        case .desktopNext: return "Move Window to Next Desktop"
         case .toggleEmojiMode: return "Toggle Emoji Search"
         case .trashTopResult: return "Move Selected Result to Trash"
         case .moveTopResult: return "Move Selected Result to…"
@@ -189,6 +195,8 @@ enum ShortcutAction: String, CaseIterable, Codable {
         case .windowRightTwoThirds: return KeyBinding(keyCode: 17, modifiers: [.control, .option]) // T
         case .displayPrevious: return KeyBinding(keyCode: 123, modifiers: [.control, .option, .command]) // Left
         case .displayNext: return KeyBinding(keyCode: 124, modifiers: [.control, .option, .command]) // Right
+        case .desktopPrevious: return KeyBinding(keyCode: 123, modifiers: [.control, .option, .shift]) // Left
+        case .desktopNext: return KeyBinding(keyCode: 124, modifiers: [.control, .option, .shift]) // Right
         case .toggleEmojiMode: return KeyBinding(keyCode: 49, modifiers: [.control, .command]) // Space
         case .trashTopResult: return KeyBinding(keyCode: 51, modifiers: [.command]) // Delete
         case .moveTopResult: return KeyBinding(keyCode: 46, modifiers: [.command]) // M
