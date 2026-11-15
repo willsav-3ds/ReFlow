@@ -194,6 +194,45 @@ enum ThemeDensity: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// How app and file icons are colored. Symbols have their own setting
+/// (`Theme.tintsSymbolIcons`), and emoji, stickers and clipboard images are never touched:
+/// those are the thing being picked, not decoration.
+enum ThemeIconStyle: String, Codable, CaseIterable, Identifiable {
+    /// As Finder shows them.
+    case original
+    /// Drained of color.
+    case monochrome
+    /// Drained of color, then redrawn in shades of the accent color.
+    case tinted
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .original: return "Full Color"
+        case .monochrome: return "Monochrome"
+        case .tinted: return "Accent Tint"
+        }
+    }
+}
+
+/// A plate drawn behind app, file and symbol icons, with the icon shrunk to sit inside it.
+enum ThemeIconBackdrop: String, Codable, CaseIterable, Identifiable {
+    case none
+    case roundedSquare
+    case circle
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .none: return "None"
+        case .roundedSquare: return "Rounded Square"
+        case .circle: return "Circle"
+        }
+    }
+}
+
 /// Every property past `appearance` defaults to how ReFlow looked before it could be
 /// changed, so a theme only has to mention what it does differently.
 struct Theme: Encodable, Identifiable, Equatable {
@@ -219,6 +258,13 @@ struct Theme: Encodable, Identifiable, Equatable {
     var fontDesign: ThemeFontDesign = .standard
     var selectionStyle: ThemeSelectionStyle = .bar
     var density: ThemeDensity = .regular
+    var iconStyle: ThemeIconStyle = .original
+    var iconBackdrop: ThemeIconBackdrop = .none
+    /// Multiplies the icon size that `density` gives.
+    var iconScale: Double = 1
+    /// Draws symbol icons (commands, scripts, Quick Links) in the accent color rather than
+    /// as secondary text.
+    var tintsSymbolIcons = false
     /// The "App", "File", … label at the trailing edge of each result.
     var showsTypeBadges = true
     /// The line between the search field and the results.
@@ -267,6 +313,10 @@ extension Theme: Decodable {
         fontDesign = try value(.fontDesign, default: fontDesign)
         selectionStyle = try value(.selectionStyle, default: selectionStyle)
         density = try value(.density, default: density)
+        iconStyle = try value(.iconStyle, default: iconStyle)
+        iconBackdrop = try value(.iconBackdrop, default: iconBackdrop)
+        iconScale = try value(.iconScale, default: iconScale)
+        tintsSymbolIcons = try value(.tintsSymbolIcons, default: tintsSymbolIcons)
         showsTypeBadges = try value(.showsTypeBadges, default: showsTypeBadges)
         showsDivider = try value(.showsDivider, default: showsDivider)
     }
@@ -363,7 +413,9 @@ final class ThemeStore: ObservableObject {
             border: ThemeColor(red: 0.25, green: 1.00, blue: 0.45),
             fontDesign: .monospaced,
             selectionStyle: .filled,
-            density: .compact
+            density: .compact,
+            iconStyle: .tinted,
+            tintsSymbolIcons: true
         ),
         Theme(
             id: UUID(uuidString: "5F0A7E10-0000-4000-8000-00000000000A")!,
@@ -376,6 +428,7 @@ final class ThemeStore: ObservableObject {
             cornerRadius: 10,
             selectionStyle: .filled,
             density: .compact,
+            iconStyle: .monochrome,
             showsDivider: false
         ),
         Theme(
@@ -547,6 +600,94 @@ private struct ThemedSurface: ViewModifier {
             content.foregroundStyle(text.color)
         } else {
             content
+        }
+    }
+}
+
+/// A result's icon, drawn the way the theme asks. Shared with the preview in Settings.
+struct ThemedIcon: View {
+    enum Artwork {
+        /// An app's or file's Finder icon, which the theme may recolor.
+        case fileIcon(NSImage)
+        /// The user's own image (a sticker, something copied), always shown as it is.
+        case picture(NSImage)
+        case emoji(String)
+        case symbol(String)
+    }
+
+    let artwork: Artwork
+    let theme: Theme
+    let accent: Color
+    /// The row is selected. Only matters to the `filled` selection style, where the row
+    /// itself is the accent color and anything drawn in that color would vanish into it.
+    var isSelected = false
+    /// The preview in Settings draws its icons smaller than the launcher does.
+    var baseSize: CGFloat?
+
+    var body: some View {
+        let size = (baseSize ?? theme.density.iconSize) * theme.iconScale
+        switch artwork {
+        case .picture(let image):
+            Image(nsImage: image)
+                .resizable()
+                .frame(width: size, height: size)
+        case .emoji(let emoji):
+            Text(emoji)
+                .font(.system(size: size))
+                .frame(width: size, height: size)
+        case .fileIcon(let image):
+            onBackdrop(size: size) { glyphSize in
+                fileIcon(image)
+                    .frame(width: glyphSize, height: glyphSize)
+            }
+        case .symbol(let name):
+            onBackdrop(size: size) { glyphSize in
+                Image(systemName: name)
+                    .font(.system(size: glyphSize * 0.75))
+                    .frame(width: glyphSize, height: glyphSize)
+                    .foregroundStyle(theme.tintsSymbolIcons && !isOnAccent ? AnyShapeStyle(accent) : AnyShapeStyle(.secondary))
+            }
+        }
+    }
+
+    private var isOnAccent: Bool {
+        isSelected && theme.selectionStyle == .filled
+    }
+
+    @ViewBuilder
+    private func fileIcon(_ image: NSImage) -> some View {
+        let icon = Image(nsImage: image).resizable()
+        switch theme.iconStyle {
+        case .original:
+            icon
+        case .monochrome:
+            icon.saturation(0)
+        case .tinted:
+            if isOnAccent {
+                icon.saturation(0)
+            } else {
+                // Multiplying a grayscale icon by the accent color turns its whites into
+                // the accent and leaves its darks dark, so the artwork stays readable
+                // whatever color the icon started as.
+                icon.saturation(0).colorMultiply(accent)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func onBackdrop(size: CGFloat, @ViewBuilder glyph: (CGFloat) -> some View) -> some View {
+        let plate = isOnAccent ? theme.onAccentColor.opacity(0.2) : accent.opacity(0.16)
+        switch theme.iconBackdrop {
+        case .none:
+            glyph(size)
+        case .roundedSquare:
+            glyph(size * 0.68)
+                .frame(width: size, height: size)
+                .background(plate, in: RoundedRectangle(cornerRadius: size * 0.24, style: .continuous))
+        case .circle:
+            glyph(size * 0.62)
+                .frame(width: size, height: size)
+                .background(plate, in: Circle())
         }
     }
 }

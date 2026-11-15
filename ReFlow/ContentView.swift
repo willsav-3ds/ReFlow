@@ -354,24 +354,10 @@ struct ResultRow: View {
     @State private var isHovering = false
     
     var body: some View {
-        let iconSize = theme.density.iconSize
         HStack(spacing: 12) {
-            // Icon
-            if let icon = result.icon ?? result.iconPath.map(IconCache.shared.icon(for:)) {
-                Image(nsImage: icon)
-                    .resizable()
-                    .frame(width: iconSize, height: iconSize)
-            } else if let emoji = result.emoji {
-                Text(emoji)
-                    .font(.system(size: iconSize))
-                    .frame(width: iconSize, height: iconSize)
-            } else {
-                Image(systemName: result.systemIcon ?? "questionmark.circle")
-                    .font(.system(size: iconSize * 0.75))
-                    .frame(width: iconSize, height: iconSize)
-                    .foregroundStyle(.secondary)
-            }
-            
+            ThemedIcon(artwork: artwork, theme: theme, accent: accent, isSelected: isSelected)
+
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(result.title)
                     .font(.system(size: theme.density.titleFontSize, weight: .medium))
@@ -403,6 +389,18 @@ struct ResultRow: View {
         .themedRowHighlight(theme, accent: accent, isSelected: isSelected, isHovering: isHovering)
         .onHover { hovering in
             isHovering = hovering
+        }
+    }
+
+    private var artwork: ThemedIcon.Artwork {
+        if let icon = result.icon {
+            return .picture(icon)
+        } else if let iconPath = result.iconPath {
+            return .fileIcon(IconCache.shared.icon(for: iconPath))
+        } else if let emoji = result.emoji {
+            return .emoji(emoji)
+        } else {
+            return .symbol(result.systemIcon ?? "questionmark.circle")
         }
     }
 }

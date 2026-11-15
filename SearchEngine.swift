@@ -266,8 +266,44 @@ class SearchEngine: ObservableObject {
             allResults.append(camera)
         }
 
+        // Window commands ("next desktop", "left half", …)
+        allResults.append(contentsOf: windowCommandResults(query: query))
+
         // Sort by relevance
         return allResults.sorted { $0.relevance > $1.relevance }
+    }
+
+    /// Every window action that has a shortcut can also be run by name: type "next
+    /// desktop" or "left half" and press Return. It acts on the window that was in front
+    /// when the launcher opened, since the launcher never takes over as the active app.
+    private func windowCommandResults(query: String) -> [SearchResult] {
+        ShortcutAction.allCases.compactMap { action in
+            guard action.isLauncherCommand else { return nil }
+            let relevance = ([action.displayName] + action.searchAliases)
+                .map { Self.calculateRelevance(text: $0, query: query) }
+                .max() ?? 0
+            // Stricter than apps (anything above zero): there are a couple of dozen of
+            // these with long, similar names, and a loose in-order letter match would have
+            // most of them turning up for nearly any short query.
+            guard relevance > 0.5 else { return nil }
+
+            return SearchResult(
+                title: action.displayName,
+                subtitle: "Shortcut: \(ShortcutStore.shared.binding(for: action).displayString)",
+                type: .windowAction,
+                systemIcon: action.symbolName,
+                relevance: relevance,
+                rankingKey: "action:\(action.rawValue)",
+                action: {
+                    // Out of the way first, then a beat for the window underneath to be
+                    // the focused one again before anything asks which window that is.
+                    LauncherWindowController.shared.hide()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        HotKeyCenter.shared.trigger(action)
+                    }
+                }
+            )
+        }
     }
 
     /// Opens a live self-view window (see `CameraView`) — ⌘C in that window copies the

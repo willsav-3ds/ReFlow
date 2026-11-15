@@ -174,6 +174,68 @@ enum ShortcutAction: String, CaseIterable, Codable {
         }
     }
 
+    /// Whether this can also be found by name in the launcher and run with Return, the
+    /// same as pressing its shortcut. That's everything that acts on a window; the rest
+    /// are about the launcher itself, which is already open by then.
+    var isLauncherCommand: Bool {
+        switch self {
+        case .toggleLauncher, .toggleEmojiMode, .trashTopResult, .moveTopResult, .showInFinderTopResult, .openSettings:
+            return false
+        default:
+            return true
+        }
+    }
+
+    /// Shorter things to type than `displayName` that should find this in the launcher.
+    var searchAliases: [String] {
+        switch self {
+        case .windowLeftHalf: return ["Left Half", "Tile Left"]
+        case .windowRightHalf: return ["Right Half", "Tile Right"]
+        case .windowTopHalf: return ["Top Half", "Tile Top"]
+        case .windowBottomHalf: return ["Bottom Half", "Tile Bottom"]
+        case .windowMaximize: return ["Fill Screen", "Full Size"]
+        case .cornerTopLeft: return ["Top Left Corner"]
+        case .cornerTopRight: return ["Top Right Corner"]
+        case .cornerBottomLeft: return ["Bottom Left Corner"]
+        case .cornerBottomRight: return ["Bottom Right Corner"]
+        case .windowLeftThird: return ["Left Third"]
+        case .windowCenterThird: return ["Center Third", "Middle Third"]
+        case .windowRightThird: return ["Right Third"]
+        case .windowLeftTwoThirds: return ["Left Two-Thirds", "Left 2/3"]
+        case .windowRightTwoThirds: return ["Right Two-Thirds", "Right 2/3"]
+        case .displayPrevious: return ["Previous Display", "Previous Monitor", "Previous Screen"]
+        case .displayNext: return ["Next Display", "Next Monitor", "Next Screen"]
+        case .desktopPrevious: return ["Previous Desktop", "Previous Space", "Desktop Left"]
+        case .desktopNext: return ["Next Desktop", "Next Space", "Desktop Right"]
+        default: return []
+        }
+    }
+
+    /// The SF Symbol shown beside this in the launcher.
+    var symbolName: String {
+        switch self {
+        case .windowLeftHalf: return "rectangle.lefthalf.inset.filled"
+        case .windowRightHalf: return "rectangle.righthalf.inset.filled"
+        case .windowTopHalf: return "rectangle.tophalf.inset.filled"
+        case .windowBottomHalf: return "rectangle.bottomhalf.inset.filled"
+        case .windowMaximize: return "rectangle.inset.filled"
+        case .windowRestore: return "rectangle.center.inset.filled"
+        case .cornerTopLeft: return "rectangle.inset.topleft.filled"
+        case .cornerTopRight: return "rectangle.inset.topright.filled"
+        case .cornerBottomLeft: return "rectangle.inset.bottomleft.filled"
+        case .cornerBottomRight: return "rectangle.inset.bottomright.filled"
+        case .windowLeftThird: return "rectangle.leadingthird.inset.filled"
+        case .windowCenterThird: return "rectangle.split.3x1"
+        case .windowRightThird: return "rectangle.trailingthird.inset.filled"
+        case .windowLeftTwoThirds: return "rectangle.leadinghalf.inset.filled"
+        case .windowRightTwoThirds: return "rectangle.trailinghalf.inset.filled"
+        case .displayPrevious, .displayNext: return "display.2"
+        case .desktopPrevious: return "arrow.left.square"
+        case .desktopNext: return "arrow.right.square"
+        default: return "command"
+        }
+    }
+
     var defaultBinding: KeyBinding {
         switch self {
         case .toggleLauncher: return KeyBinding(keyCode: 49, modifiers: [.command]) // Space
@@ -353,6 +415,12 @@ final class HotKeyCenter {
         }
         hotKeyRefs.removeAll()
         idToAction.removeAll()
+    }
+
+    /// Runs `action` exactly as its hotkey would. For anything that triggers an action
+    /// some other way, such as picking it from the launcher.
+    func trigger(_ action: ShortcutAction) {
+        handler?(action)
     }
 
     fileprivate func handleHotKey(id: UInt32) {

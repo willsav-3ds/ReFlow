@@ -297,23 +297,41 @@ class WindowManager {
     // MARK: - Desktops
 
     func moveActiveWindowToPreviousDesktop() {
-        moveActiveWindowToAdjacentDesktop(arrowKeyCode: 123) // Left
+        moveActiveWindowToAdjacentDesktop(towardLeft: true)
     }
 
     func moveActiveWindowToNextDesktop() {
-        moveActiveWindowToAdjacentDesktop(arrowKeyCode: 124) // Right
+        moveActiveWindowToAdjacentDesktop(towardLeft: false)
     }
 
     /// True from the simulated mouse-down until the matching mouse-up has been posted, so a
     /// second press can't start another sequence on top of a window that's still held.
     private var isMovingBetweenDesktops = false
+    /// The direction of a press that arrived mid-move, run as soon as that move finishes —
+    /// so pressing the shortcut twice in a row moves the window two desktops over instead
+    /// of dropping the second press. Only the latest one is kept.
+    private var queuedDesktopMoveIsTowardLeft: Bool?
+    /// The system's space-switching shortcut, if it was off and had to be switched on for
+    /// the move in progress. Switched back off when the move ends.
+    private var shortcutToDisableAgain: Int32?
 
-    /// There's no public API for moving a window to another Space, so this does what you'd
-    /// do by hand: hold the window by its title bar and press ⌃← or ⌃→, which carries the
-    /// held window along when macOS switches desktops. That means it relies on the "Move
-    /// left/right a space" shortcuts being enabled in System Settings (they are by default).
-    private func moveActiveWindowToAdjacentDesktop(arrowKeyCode: CGKeyCode) {
-        guard !isMovingBetweenDesktops else { return }
+    /// Nothing can move another app's window to a different Space directly any more. The
+    /// private SkyLight calls that used to (`CGSMoveWindowsToManagedSpace`, the
+    /// add/remove pair, the compat-ID workaround yabai found for 14.5) are all silently
+    /// ignored for windows of other processes on current macOS, and yabai's remaining
+    /// route is injecting code into the Dock with System Integrity Protection off. What's
+    /// left is what Amethyst and the Hammerspoon scripts ended up with too: do what you'd
+    /// do by hand. Hold the window by its title bar and press the "Move left/right a
+    /// space" shortcut, which carries the held window along when macOS switches desktops.
+    ///
+    /// SkyLight's read-only calls do still work (see `Spaces`), and they take the guesswork
+    /// out of it: whether there's a desktop on that side at all, which keys the shortcut
+    /// is really set to, and the moment the window has landed.
+    private func moveActiveWindowToAdjacentDesktop(towardLeft: Bool) {
+        guard !isMovingBetweenDesktops else {
+            queuedDesktopMoveIsTowardLeft = towardLeft
+            return
+        }
         guard let window = getFrontmostWindow() else { return }
 
         // A full-screen window is its own Space and can't be dragged, so the ⌃-arrow would
@@ -322,6 +340,17 @@ class WindowManager {
             print("ReFlow[desktops]: window is in native full screen — can't move it to another desktop.")
             return
         }
+
+        // Checked before touching the mouse, so that at the last desktop nothing happens
+        // at all, rather than the cursor darting to the window and back for no reason.
+        let windowID = Spaces.windowID(of: window)
+        let originalSpaces = windowID.flatMap { Spaces.spaces(ofWindow: $0) } ?? []
+        if Spaces.hasSpace(beside: originalSpaces, offset: towardLeft ? -1 : 1) == false {
+            print("ReFlow[desktops]: no desktop on that side to move the window to.")
+            NSSound.beep()
+            return
+        }
+
         guard let originalFrame = currentAXFrame(of: window) else { return }
         let grabPoints = titleBarGrabPoints(of: window, frame: originalFrame)
         guard !grabPoints.isEmpty else {
@@ -335,12 +364,22 @@ class WindowManager {
         tileGeneration += 1
         let move = DesktopMove(
             window: window,
+            windowID: windowID,
+            originalSpaces: originalSpaces,
             originalFrame: originalFrame,
-            arrowKeyCode: arrowKeyCode,
+            // ⌃← / ⌃→ unless the shortcut can be read and says otherwise. Real arrow-key
+            // events carry the function and numeric-pad flags too, and the system's
+            // shortcut is registered with the function flag included.
+            shortcut: Spaces.moveShortcut(towardLeft: towardLeft) ?? Spaces.Shortcut(
+                id: nil,
+                keyCode: towardLeft ? 123 : 124,
+                flags: [.maskControl, .maskSecondaryFn, .maskNumericPad],
+                isEnabled: true
+            ),
             source: CGEventSource(stateID: .privateState),
             originalCursorLocation: CGEvent(source: nil)?.location
         )
-        whenModifiersReleased(deadline: Date().addingTimeInterval(0.6)) { [weak self] in
+        whenModifiersReleased(deadline: Date().addingTimeInterval(0.3)) { [weak self] in
             self?.grabWindow(for: move, at: grabPoints[...])
         }
     }
@@ -348,7 +387,7 @@ class WindowManager {
     /// The hotkey's own modifiers are usually still physically down when it fires, and a
     /// click with ⌃ held is a right-click. Waiting for them to come up (checking every 10ms)
     /// avoids that; the deadline keeps someone holding them from stalling the move, with
-    /// the explicit event flags in `performDesktopMove` covering that case.
+    /// the explicit flags on every posted event covering that case.
     private func whenModifiersReleased(deadline: Date, _ body: @escaping () -> Void) {
         let held = CGEventSource.flagsState(.hidSystemState)
             .intersection([.maskControl, .maskAlternate, .maskShift, .maskCommand])
@@ -364,10 +403,15 @@ class WindowManager {
     /// Everything one move between desktops needs to carry from step to step.
     private struct DesktopMove {
         let window: TileTarget
+        /// The window server's own ID for the window and the Space(s) it started on, for
+        /// telling when it has arrived. `nil`/empty if they couldn't be looked up.
+        let windowID: CGWindowID?
+        let originalSpaces: Set<UInt64>
         /// Where the window was before it was grabbed, in AX coordinates. Used both to tell
         /// whether a grab took hold and to put the window back exactly afterward.
         let originalFrame: CGRect
-        let arrowKeyCode: CGKeyCode
+        /// The keys that switch desktops in the wanted direction.
+        let shortcut: Spaces.Shortcut
         let source: CGEventSource?
         let originalCursorLocation: CGPoint?
     }
@@ -383,11 +427,9 @@ class WindowManager {
         event.post(tap: .cghidEventTap)
     }
 
-    // Real arrow-key events carry the function and numeric-pad flags too, and the
-    // system's Space-switching shortcut is registered with the function flag included.
-    private func postArrow(keyDown: Bool, for move: DesktopMove) {
-        guard let event = CGEvent(keyboardEventSource: move.source, virtualKey: move.arrowKeyCode, keyDown: keyDown) else { return }
-        event.flags = [.maskControl, .maskSecondaryFn, .maskNumericPad]
+    private func postShortcutKey(keyDown: Bool, for move: DesktopMove) {
+        guard let event = CGEvent(keyboardEventSource: move.source, virtualKey: move.shortcut.keyCode, keyDown: keyDown) else { return }
+        event.flags = move.shortcut.flags
         event.post(tap: .cghidEventTap)
     }
 
@@ -459,12 +501,54 @@ class WindowManager {
     }
 
     private func carryWindow(for move: DesktopMove, heldAt grabPoint: CGPoint) {
+        // With "Move left/right a space" switched off in System Settings the key press
+        // would do nothing, so it's switched on just for as long as this takes.
+        if let id = move.shortcut.id, !move.shortcut.isEnabled, Spaces.setShortcutEnabled(id, true) {
+            shortcutToDisableAgain = id
+        }
         let steps: [(delay: TimeInterval, action: () -> Void)] = [
-            (0, { [self] in postArrow(keyDown: true, for: move) }),
-            (0.03, { [self] in postArrow(keyDown: false, for: move) }),
-            // Long enough for the desktop-switch animation, so the window is still held
-            // when it finishes rather than getting dropped on the desktop being left.
-            (0.45, { [self] in postMouse(.leftMouseDragged, at: grabPoint, for: move) }),
+            (0, { [self] in postShortcutKey(keyDown: true, for: move) }),
+            (0.03, { [self] in postShortcutKey(keyDown: false, for: move) }),
+            (0, { [self] in
+                whenWindowHasLanded(for: move, deadline: Date().addingTimeInterval(Self.longestDesktopSwitch)) { [self] in
+                    releaseWindow(for: move, heldAt: grabPoint)
+                }
+            }),
+        ]
+        runSteps(steps[...])
+    }
+
+    /// How long to keep hold of a window that never reports arriving, and the fixed wait
+    /// used when its Space can't be watched at all. The switch itself takes about 0.3s.
+    private static let longestDesktopSwitch: TimeInterval = 1.0
+    private static let unobservedDesktopSwitch: TimeInterval = 0.45
+
+    /// Runs `body` once the held window is on a different Space. While it's being carried
+    /// it's reported as being on no Space at all, then on the new one the moment the
+    /// switch completes — so this lets go right then, rather than after a fixed wait that
+    /// has to be long enough for the slowest switch.
+    private func whenWindowHasLanded(for move: DesktopMove, deadline: Date, _ body: @escaping () -> Void) {
+        guard let windowID = move.windowID, !move.originalSpaces.isEmpty else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.unobservedDesktopSwitch, execute: body)
+            return
+        }
+        if let spaces = Spaces.spaces(ofWindow: windowID), !spaces.isEmpty, spaces.isDisjoint(with: move.originalSpaces) {
+            body()
+            return
+        }
+        guard Date() < deadline else {
+            print("ReFlow[desktops]: the window never arrived on another desktop — letting go of it where it is.")
+            body()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+            self?.whenWindowHasLanded(for: move, deadline: deadline, body)
+        }
+    }
+
+    private func releaseWindow(for move: DesktopMove, heldAt grabPoint: CGPoint) {
+        let steps: [(delay: TimeInterval, action: () -> Void)] = [
+            (0.03, { [self] in postMouse(.leftMouseDragged, at: grabPoint, for: move) }),
             (0.03, { [self] in postMouse(.leftMouseUp, at: grabPoint, for: move) }),
             (0.05, { [self] in
                 restoreOriginalPosition(for: move)
@@ -496,7 +580,16 @@ class WindowManager {
         if let originalCursorLocation = move.originalCursorLocation {
             postMouse(.mouseMoved, at: originalCursorLocation, for: move)
         }
+        if let id = shortcutToDisableAgain {
+            Spaces.setShortcutEnabled(id, false)
+            shortcutToDisableAgain = nil
+        }
         isMovingBetweenDesktops = false
+
+        if let towardLeft = queuedDesktopMoveIsTowardLeft {
+            queuedDesktopMoveIsTowardLeft = nil
+            moveActiveWindowToAdjacentDesktop(towardLeft: towardLeft)
+        }
     }
 
     /// Runs each step after its delay without blocking the main thread: ReFlow has to stay
@@ -853,7 +946,11 @@ class WindowManager {
     /// Bumped by every new tiling request (and move between desktops), so settle checks
     /// left over from an earlier one stand down instead of dragging the window back.
     private var tileGeneration = 0
-    private static let settleCheckDelays: [TimeInterval] = [0.15, 0.4, 0.8]
+    /// The gaps between settle checks: frequent at first, when a late change is most
+    /// likely, and running for a little over a second in all.
+    private static let settleCheckDelays: [TimeInterval] = [0.05, 0.05, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4]
+    /// How many checks are left when about 0.6s has passed.
+    private static let patientSettleChecks = 2
 
     /// Some apps keep adjusting their window after a tile has been applied and verified.
     /// Music is the one this was seen with: tiled to the right half it sits fully in view,
@@ -863,22 +960,82 @@ class WindowManager {
     /// where a window of its size belongs. For a window that stayed put, each check is a
     /// single frame read.
     private func scheduleSettleChecks(for window: AXUIElement, target screenSpaceFrame: CGRect, within bounds: CGRect) {
-        let generation = tileGeneration
-        for delay in Self.settleCheckDelays {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self, self.tileGeneration == generation else { return }
-                // A held mouse button means the user has already taken over the window —
-                // leave it alone from here on.
-                guard NSEvent.pressedMouseButtons == 0 else {
-                    self.tileGeneration += 1
-                    return
-                }
-                guard let landed = self.getWindowFrame(window) else { return }
-                let fitted = self.axFrame(fromScreenSpace: self.fittedFrame(size: landed.size, target: screenSpaceFrame, bounds: bounds))
-                guard !self.framesMatch(landed, fitted) else { return }
-                print("ReFlow[tiling]: window drifted to \(landed) after tiling — re-placing it at \(fitted.origin) to keep it fully visible.")
-                self.setPosition(fitted.origin, of: window)
+        settleCheck(window, target: screenSpaceFrame, within: bounds, generation: tileGeneration, delays: Self.settleCheckDelays[...])
+    }
+
+    private func settleCheck(_ window: AXUIElement, target screenSpaceFrame: CGRect, within bounds: CGRect, generation: Int, delays: ArraySlice<TimeInterval>) {
+        guard let delay = delays.first else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.tileGeneration == generation else { return }
+            // A held mouse button means the user has already taken over the window —
+            // leave it alone from here on.
+            guard NSEvent.pressedMouseButtons == 0 else {
+                self.tileGeneration += 1
+                return
             }
+            let remaining = delays.dropFirst()
+            defer {
+                self.settleCheck(window, target: screenSpaceFrame, within: bounds, generation: generation, delays: remaining)
+            }
+
+            func placement(for size: CGSize) -> CGRect {
+                self.axFrame(fromScreenSpace: self.fittedFrame(size: size, target: screenSpaceFrame, bounds: bounds))
+            }
+            guard let landed = self.settledFrame(of: window, where: { self.framesMatch($0, placement(for: $0.size)) }) else { return }
+            let fitted = placement(for: landed.frame.size)
+            guard !self.framesMatch(landed.frame, fitted) else { return }
+
+            // Out of place, but only worth moving once it has stopped changing: correcting
+            // a window that's still resizing or animating means correcting it again a
+            // moment later, and each of those is a visible jump. Likewise one that's
+            // smaller than a minimum it showed before, which may be about to grow back
+            // (see `applyWindowFrame`). The last few checks stop waiting for either.
+            if remaining.count > Self.patientSettleChecks {
+                let expectedSize = self.expectedSize(of: window, whenAskedFor: screenSpaceFrame.size)
+                let mayStillGrow = landed.frame.width < expectedSize.width - 2 || landed.frame.height < expectedSize.height - 2
+                guard landed.hasStopped, !mayStillGrow else { return }
+            }
+            print("ReFlow[tiling]: window drifted to \(landed.frame) after tiling — re-placing it at \(fitted.origin) to keep it fully visible.")
+            self.noteSize(landed.frame.size, of: window, whenAskedFor: screenSpaceFrame.size)
+            self.setPosition(fitted.origin, of: window)
+        }
+    }
+
+    /// Sizes that windows turned out not to shrink below, by window. Knowing one up front
+    /// means the window can be put where a window of *that* size belongs straight away,
+    /// instead of being placed for the size that was asked for and corrected once it's
+    /// seen to be bigger — which is the window jumping out of view and back.
+    private var learnedMinimumSizes: [AXUIElement: CGSize] = [:]
+
+    /// The size `window` is expected to end up when asked to be `size`.
+    private func expectedSize(of window: AXUIElement, whenAskedFor size: CGSize) -> CGSize {
+        guard let minimum = learnedMinimumSizes[window] else { return size }
+        return CGSize(width: max(size.width, minimum.width), height: max(size.height, minimum.height))
+    }
+
+    /// Records what `window` actually did when asked to be `requested`. Ending up bigger
+    /// means it has a minimum; taking a size below a recorded minimum means that minimum
+    /// is out of date (Music's differs between its full window and the MiniPlayer).
+    private func noteSize(_ actual: CGSize, of window: AXUIElement, whenAskedFor requested: CGSize) {
+        func minimum(_ actual: CGFloat, _ requested: CGFloat, _ known: CGFloat) -> CGFloat {
+            if actual > requested + 2 { return actual }
+            return requested < known - 2 ? 0 : known
+        }
+        let known = learnedMinimumSizes[window] ?? .zero
+        let updated = CGSize(
+            width: minimum(actual.width, requested.width, known.width),
+            height: minimum(actual.height, requested.height, known.height)
+        )
+        guard updated != known else { return }
+        if updated == .zero {
+            learnedMinimumSizes[window] = nil
+        } else {
+            // Entries for windows that have since closed are never looked up again, so
+            // rather than track which those are, start over once there are a lot.
+            if learnedMinimumSizes.count >= 64 {
+                learnedMinimumSizes.removeAll()
+            }
+            learnedMinimumSizes[window] = updated
         }
     }
 
@@ -891,9 +1048,19 @@ class WindowManager {
                 _ = setEnhancedUserInterface(for: window, enabled: true)
             }
         }
+        write(origin: origin, to: window)
+    }
+
+    @discardableResult
+    private func write(origin: CGPoint, to window: AXUIElement) -> AXError {
         var position = origin
-        let positionValue = AXValueCreate(.cgPoint, &position)!
-        AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, positionValue)
+        return AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, AXValueCreate(.cgPoint, &position)!)
+    }
+
+    @discardableResult
+    private func write(size: CGSize, to window: AXUIElement) -> AXError {
+        var size = size
+        return AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, AXValueCreate(.cgSize, &size)!)
     }
 
     private func applyOwnWindowFrame(_ window: NSWindow, frame screenSpaceFrame: CGRect, within bounds: CGRect) {
@@ -973,21 +1140,114 @@ class WindowManager {
             }
         }
 
-        // Fast path: one size → position → size write (the order Rectangle uses — the
-        // trailing size re-applies whatever an app clamped while the window was still at
-        // its old position), checked once. Most apps take it exactly, so the window moves
-        // straight to its tile in a single visible step. Going through the two-phase write
-        // below every time is what made windows visibly jump around: phase 1 shows the new
-        // size at the *old* vertical position, phase 2 then slides it into place, and
-        // each read-back retry can nudge it again. That path is still there for whatever
-        // doesn't land here — Safari's stale-value reconciliation, minimum-size windows.
         // However the window gets there, check back on it afterward: see `scheduleSettleChecks`.
         defer { scheduleSettleChecks(for: window, target: screenSpaceFrame, within: bounds) }
 
-        if writeDirectly(targetFrame, to: window) {
+        // The aim is for the window to go to its tile in one visible step, and never to be
+        // anywhere it shouldn't be on the way. Two things used to get in the way of that.
+        //
+        // A position and a size can only be written one after the other, so there's always
+        // a moment with one applied and not the other. Written in the wrong order, that
+        // moment has the window hanging off the screen (a full-width window moved to the
+        // right half before being narrowed), and it's long enough to see. So the order
+        // depends on which way the window is changing: if it's only growing, move it
+        // first, since the size it already has fits inside the tile; otherwise resize it
+        // first.
+        //
+        // And a window doesn't always take the size it's given — Music won't go narrower
+        // than its minimum. Placing one at the tile's own origin regardless pushed it off
+        // the side of the screen or behind the Dock until a later step noticed and pulled
+        // it back. So a window is only ever placed where a window of the size it really
+        // has belongs (`fittedFrame`): its size is read back before it's moved, or already
+        // known from last time (`learnedMinimumSizes`).
+        let tileSize = screenSpaceFrame.size
+        let expectedSize = expectedSize(of: window, whenAskedFor: tileSize)
+        func placement(for size: CGSize) -> CGRect {
+            axFrame(fromScreenSpace: fittedFrame(size: size, target: screenSpaceFrame, bounds: bounds))
+        }
+        let expected = placement(for: expectedSize)
+        let current = getWindowFrame(window)
+
+        if let current, current.width <= expected.width + 1, current.height <= expected.height + 1 {
+            write(origin: expected.origin, to: window)
+            write(size: tileSize, to: window)
+        } else {
+            write(size: tileSize, to: window)
+            // Only waited for if the window is still bigger than it should be, which is
+            // what a minimum size looks like. Coming out *smaller* is something else: the
+            // app clamping the size to what fit on screen at the window's old position.
+            // That's fixed by asking again once the window has moved (the order Rectangle
+            // uses: size, position, size), so those dimensions are placed as if they'd
+            // already taken.
+            let resized = settledFrame(of: window, where: {
+                $0.width <= expectedSize.width + 2 && $0.height <= expectedSize.height + 2
+            })?.frame.size ?? expectedSize
+            let sizeToPlace = CGSize(width: max(resized.width, expectedSize.width), height: max(resized.height, expectedSize.height))
+            write(origin: sizesMatch(sizeToPlace, expectedSize) ? expected.origin : placement(for: sizeToPlace).origin, to: window)
+            if !sizesMatch(resized, expectedSize) {
+                write(size: tileSize, to: window)
+            }
+        }
+
+        guard let landed = settledFrame(of: window, where: { self.framesMatch($0, expected) }) else { return }
+        // A window that's still changing (an app animating its own resize) is left to the
+        // settle checks: writing to it again now would only make it jump mid-animation.
+        guard landed.hasStopped else { return }
+        if framesMatch(landed.frame, expected) {
+            noteSize(landed.frame.size, of: window, whenAskedFor: tileSize)
             return
         }
 
+        // Smaller than asked in some direction isn't a minimum size at work. It's either a
+        // window that can't be resized that far (rare), or an app that mishandled the
+        // writes — which the slower, more careful route below exists for.
+        if landed.frame.width < tileSize.width - 2 || landed.frame.height < tileSize.height - 2 {
+            applyInPhases(window, targetFrame: targetFrame, screenSpaceFrame: screenSpaceFrame, within: bounds)
+            return
+        }
+
+        // Smaller than a minimum it showed before. Either that minimum no longer applies,
+        // or the window takes any size and then grows back a moment later. It's in view
+        // where it is, so wait and see: the settle checks move it if it stays this size.
+        if landed.frame.width < expectedSize.width - 2 || landed.frame.height < expectedSize.height - 2 {
+            return
+        }
+
+        // Bigger than expected: a minimum size nobody knew about yet. Remember it, and move
+        // the window to where one of that size belongs.
+        noteSize(landed.frame.size, of: window, whenAskedFor: tileSize)
+        let fitted = placement(for: landed.frame.size)
+        if !framesMatch(landed.frame, fitted) {
+            print("ReFlow[tiling]: window landed at \(landed.frame) instead of \(targetFrame) — re-placing it at \(fitted.origin) to keep it fully visible.")
+            write(origin: fitted.origin, to: window)
+        }
+    }
+
+    /// Reads the window's frame, giving it a moment (up to 60ms) if it isn't yet what
+    /// `isExpected` is looking for: an app doesn't always finish applying a write before
+    /// the write returns. Safari in particular reconciles with the window server
+    /// afterward, so an immediate read-back can catch it mid-way. `hasStopped` is false
+    /// if the frame was still changing when time ran out.
+    private func settledFrame(of window: AXUIElement, where isExpected: (CGRect) -> Bool) -> (frame: CGRect, hasStopped: Bool)? {
+        guard var frame = getWindowFrame(window) else { return nil }
+        if isExpected(frame) { return (frame, true) }
+        for _ in 0..<4 {
+            Thread.sleep(forTimeInterval: 0.015)
+            guard let next = getWindowFrame(window) else { return nil }
+            if isExpected(next) || next == frame { return (next, true) }
+            frame = next
+        }
+        return (frame, false)
+    }
+
+    private func sizesMatch(_ lhs: CGSize, _ rhs: CGSize, tolerance: CGFloat = 2.0) -> Bool {
+        abs(lhs.width - rhs.width) <= tolerance && abs(lhs.height - rhs.height) <= tolerance
+    }
+
+    /// The careful way to write a frame, for a window the direct writes in
+    /// `applyWindowFrame` left the wrong size. Slower, and the window visibly moves in two
+    /// steps, which is why it isn't the first thing tried.
+    private func applyInPhases(_ window: AXUIElement, targetFrame: CGRect, screenSpaceFrame: CGRect, within bounds: CGRect) {
         // Safari's AX bridge doesn't reliably apply a position and a size sent as two
         // separate calls in the order we actually sent them — it can reconcile them using
         // a *stale* value for whichever one it processes second, no matter which order
@@ -1048,24 +1308,6 @@ class WindowManager {
         }
     }
 
-    /// The single-step write behind `applyWindowFrame`'s fast path. Returns whether the
-    /// window actually ended up at `target`, without retrying — a miss falls through to
-    /// the two-phase write instead.
-    private func writeDirectly(_ target: CGRect, to window: AXUIElement) -> Bool {
-        var position = target.origin
-        var size = target.size
-        let positionValue = AXValueCreate(.cgPoint, &position)!
-        let sizeValue = AXValueCreate(.cgSize, &size)!
-
-        AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, sizeValue)
-        AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, positionValue)
-        AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, sizeValue)
-
-        // Same settle time as `writeAndVerify`, for the same Safari IPC reason.
-        Thread.sleep(forTimeInterval: 0.02)
-        return getWindowFrame(window).map { framesMatch($0, target) } ?? false
-    }
-
     /// Writes `target` to `window`, touching only the AX attributes the caller asks for —
     /// see the two-phase strategy in `applyWindowFrame` for why that matters — then reads
     /// the frame back to confirm it actually landed, retrying up to twice more if it
@@ -1120,5 +1362,92 @@ class WindowManager {
             abs(lhs.origin.y - rhs.origin.y) <= tolerance &&
             abs(lhs.width - rhs.width) <= tolerance &&
             abs(lhs.height - rhs.height) <= tolerance
+    }
+}
+
+/// What ReFlow can find out about Spaces. None of it has a public API, so these are
+/// SkyLight's private calls, looked up by name at run time: if a macOS update drops one, its
+/// lookup comes back `nil` and whatever relied on it falls back to working without, rather
+/// than ReFlow failing to launch. Only calls that read are used, plus switching a system
+/// keyboard shortcut on and off.
+private enum Spaces {
+    private static let handle = dlopen(nil, RTLD_LAZY)
+
+    private static func function<Function>(_ name: String, as type: Function.Type) -> Function? {
+        dlsym(handle, name).map { unsafeBitCast($0, to: type) }
+    }
+
+    private static let mainConnection = function("CGSMainConnectionID", as: (@convention(c) () -> Int32).self)
+    private static let copySpacesForWindows = function("CGSCopySpacesForWindows", as: (@convention(c) (Int32, Int32, CFArray) -> Unmanaged<CFArray>?).self)
+    private static let copyManagedDisplaySpaces = function("CGSCopyManagedDisplaySpaces", as: (@convention(c) (Int32) -> Unmanaged<CFArray>?).self)
+    private static let getWindow = function("_AXUIElementGetWindow", as: (@convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError).self)
+    private static let isHotKeyEnabled = function("CGSIsSymbolicHotKeyEnabled", as: (@convention(c) (Int32) -> Bool).self)
+    private static let setHotKeyEnabled = function("CGSSetSymbolicHotKeyEnabled", as: (@convention(c) (Int32, Bool) -> Int32).self)
+    private static let getHotKeyValue = function("CGSGetSymbolicHotKeyValue", as: (@convention(c) (Int32, UnsafeMutablePointer<UInt16>, UnsafeMutablePointer<UInt16>, UnsafeMutablePointer<UInt64>) -> Int32).self)
+
+    static func windowID(of target: WindowManager.TileTarget) -> CGWindowID? {
+        switch target {
+        case .accessibility(let window):
+            var id: CGWindowID = 0
+            guard let getWindow, getWindow(window, &id) == .success, id != 0 else { return nil }
+            return id
+        case .own(let window):
+            return window.windowNumber > 0 ? CGWindowID(window.windowNumber) : nil
+        }
+    }
+
+    /// The Spaces a window is on: normally one, or none while it's being carried between two.
+    static func spaces(ofWindow id: CGWindowID) -> Set<UInt64>? {
+        let allSpaces: Int32 = 7
+        guard let mainConnection, let copySpacesForWindows,
+              let spaces = copySpacesForWindows(mainConnection(), allSpaces, [NSNumber(value: id)] as CFArray)?.takeRetainedValue() as? [NSNumber] else { return nil }
+        return Set(spaces.map(\.uint64Value))
+    }
+
+    /// Whether the display showing `spaces` has another Space `offset` places along from
+    /// it, in Mission Control's order. `nil` if that can't be worked out.
+    static func hasSpace(beside spaces: Set<UInt64>, offset: Int) -> Bool? {
+        guard !spaces.isEmpty, let mainConnection, let copyManagedDisplaySpaces,
+              let displays = copyManagedDisplaySpaces(mainConnection())?.takeRetainedValue() as? [[String: Any]] else { return nil }
+        for display in displays {
+            let ids = (display["Spaces"] as? [[String: Any]] ?? []).compactMap { ($0["ManagedSpaceID"] as? NSNumber)?.uint64Value }
+            if let index = ids.firstIndex(where: spaces.contains) {
+                return ids.indices.contains(index + offset)
+            }
+        }
+        return nil
+    }
+
+    /// A system keyboard shortcut ("symbolic hot key").
+    struct Shortcut {
+        /// `nil` for a stand-in used when the real shortcut couldn't be read.
+        let id: Int32?
+        let keyCode: CGKeyCode
+        let flags: CGEventFlags
+        let isEnabled: Bool
+    }
+
+    /// "Move left a space" / "Move right a space" as currently set in System Settings →
+    /// Keyboard → Keyboard Shortcuts → Mission Control.
+    static func moveShortcut(towardLeft: Bool) -> Shortcut? {
+        let id: Int32 = towardLeft ? 79 : 81
+        guard let getHotKeyValue, let isHotKeyEnabled else { return nil }
+        var character: UInt16 = 0
+        var keyCode: UInt16 = 0
+        var modifiers: UInt64 = 0
+        guard getHotKeyValue(id, &character, &keyCode, &modifiers) == 0, keyCode != UInt16.max else { return nil }
+
+        var flags = CGEventFlags(rawValue: modifiers)
+            .intersection([.maskControl, .maskAlternate, .maskShift, .maskCommand, .maskSecondaryFn])
+        if (123...126).contains(keyCode) {
+            flags.formUnion([.maskSecondaryFn, .maskNumericPad])
+        }
+        return Shortcut(id: id, keyCode: keyCode, flags: flags, isEnabled: isHotKeyEnabled(id))
+    }
+
+    @discardableResult
+    static func setShortcutEnabled(_ id: Int32, _ enabled: Bool) -> Bool {
+        guard let setHotKeyEnabled else { return false }
+        return setHotKeyEnabled(id, enabled) == 0
     }
 }

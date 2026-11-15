@@ -41,7 +41,7 @@ WindowManager — AX-based window tiling, invoked directly by AppDelegate.perfor
 | `WindowManager.swift` | `WindowManager` singleton: all window-tiling geometry plus the Accessibility-API plumbing to read/move the frontmost window |
 | `Shortcuts.swift` | `KeyBinding`, `ShortcutAction` (every bindable action, its scope/section/display name/default), `ShortcutStore` (persisted bindings + conflict detection), `HotKeyCenter` (Carbon global-hotkey registration) |
 | `SettingsView.swift` | The `Settings` scene: one tab per feature area (Shortcuts, Scripts, File Search, Quick Links, Stickers, Clipboard, Themes) |
-| `ThemeStore.swift` | `Theme` model, built-in themes, persisted custom themes and active theme; applies appearance through `NSApp.appearance`; `ThemeBackground` (the launcher's backdrop) and the `themedSurface`/`themedRowHighlight` modifiers shared by the launcher and the Settings preview. `Theme` decodes by hand so themes saved before a property existed still load |
+| `ThemeStore.swift` | `Theme` model, built-in themes, persisted custom themes and active theme; applies appearance through `NSApp.appearance`; `ThemeBackground` (the launcher's backdrop), the `themedSurface`/`themedRowHighlight` modifiers and `ThemedIcon` (a result's icon: recoloring for app/file icons, backdrop, size, symbol color) shared by the launcher and the Settings preview. `Theme` decodes by hand so themes saved before a property existed still load |
 | `RankingStore.swift` | Persists per-item usage counts and turns them into a small relevance boost |
 | `QuickLinkStore.swift` | `QuickLink` model + persisted store; `QuickLinkStore.open(_:)` opens a URL or filesystem path |
 | `ClipboardPaste.swift` | The paste mechanism: snapshot the pasteboard → set new contents → reactivate the previously-frontmost app → simulate `⌘V` → restore the original pasteboard |
@@ -104,7 +104,13 @@ back to the general app/file/script/quick-link search:
 2. Exactly `cb` (only if Clipboard History is enabled) → switches to Clipboard History mode
 3. Looks like a math expression (`CalculatorEngine.looksLikeExpression`) → replaces the
    result list entirely with the calculator answer
-4. Otherwise → apps + scripts + quick links, merged and sorted by relevance
+4. Otherwise → apps + scripts + quick links + window commands, merged and sorted by relevance
+
+**Window commands** (`windowCommandResults`) are every `ShortcutAction` whose
+`isLauncherCommand` is true, matched on its `displayName` and `searchAliases` (above 0.5, so
+not on the loose fuzzy tier). Running one hides the launcher and, 50ms later, calls
+`HotKeyCenter.trigger(_:)` — the same handler the hotkey itself reaches — so it acts on the
+window that was focused underneath. They're ranked under `"action:<rawValue>"`.
 
 **Relevance** (`SearchEngine.calculateRelevance`) is a simple tiered text match: exact match
 (1.0) > prefix match (0.9) > substring match (0.7) > in-order fuzzy match, i.e. every query
@@ -153,36 +159,60 @@ private API:
 - **Debouncing** (`setWindowFrame`, 50ms): rapid-fire hotkey presses coalesce to only the
   most recently requested frame, so cycling quickly through tiling positions doesn't visibly
   bounce the window through intermediate states.
+- **Write order** (`applyWindowFrame`): position and size are separate writes, so the order
+  is chosen so the in-between state stays on screen — position first when the window is only
+  growing, size first otherwise. After a size-first write the size is read back before the
+  window is moved, so a window that wouldn't shrink that far (a minimum size) goes straight
+  to where a window of its real size belongs (`fittedFrame`) instead of being put at the
+  tile's origin, hanging off the screen, and pulled back. Minimum sizes seen this way are
+  remembered per window (`learnedMinimumSizes`, in memory) and used for placement up front
+  next time. `applyInPhases`, the older two-phase write with retries, is now only the
+  fallback for a window left *smaller* than asked.
 - **App-specific workarounds** applied in `applyWindowFrame`, both matching known fixes from
   other AX-driven tiling tools (Rectangle, Amethyst, Silica/Slate):
   - Temporarily disables an app's `"AXEnhancedUserInterface"` attribute (undocumented but
     public) while writing the frame — Safari and others can have this on, which otherwise
     makes position/size writes report `.success` while silently doing nothing.
-  - Writes position before size normally (avoids a visible "jump then resize" double-step
-    when growing), but size before position when *shrinking* — except for apps with
-    interdependent position/size (currently just Safari, `hasInterdependentPositionAndSize`),
-    where position must always be written first or the app silently discards the size it was
-    just given.
   - Explicitly checks `AXUIElementIsAttributeSettable` first and skips (with a log line)
     windows that can't be resized via AX at all — e.g. one in native full-screen.
 
-- **Settle checks** (`scheduleSettleChecks`): 0.15s, 0.4s and 0.8s after a tile is applied,
-  the window's frame is read again and re-fitted inside the visible area if it has moved or
-  resized since — Music ends up hanging off the screen edge a moment after being tiled to
-  the right half. A newer tiling request, or the user holding a mouse button, cancels them.
+- **Settle checks** (`scheduleSettleChecks`): eight times over the 1.3s after a tile is
+  applied (every 50ms at first), the window's frame is read again and re-fitted inside the
+  visible area if it has moved or resized since — Music ends up hanging off the screen edge
+  a moment after being tiled to the right half. A window that's still changing is left until
+  it stops, so it isn't corrected twice. A newer tiling request, or the user holding a mouse
+  button, cancels them.
 
 All tiling failures are logged to stderr with the `ReFlow[tiling]:` prefix rather than failing
 silently, to make diagnosing a misbehaving target app possible.
 
 ### Moving windows between desktops
 
-There's no public API for moving a window to another Space, so
-`moveActiveWindowToAdjacentDesktop` simulates the manual gesture with `CGEvent`s: mouse down
-in the title bar, a small drag so the window is actually held, `⌃←`/`⌃→`, a wait for the
-switch animation, then the drag undone, mouse up, and the cursor put back. The window is
-then set back to its exact original position, since undoing the drag doesn't reliably land
-it on the same pixel. Steps run through `asyncAfter` so the main thread stays free, and
-`isMovingBetweenDesktops` drops presses made mid-sequence.
+There's no public API for moving a window to another Space, and the private ones no longer
+work on other apps' windows: `CGSMoveWindowsToManagedSpace`, `CGSAddWindowsToSpaces` /
+`CGSRemoveWindowsFromSpaces` and the `SLSSpaceSetCompatID` workaround were all tried on
+macOS 27.2 and silently did nothing. (yabai gets around that by injecting into the Dock with
+SIP off; AeroSpace and FlashSpace avoid native Spaces altogether.) So
+`moveActiveWindowToAdjacentDesktop` does what Amethyst and the Hammerspoon scripts do and
+simulates the manual gesture with `CGEvent`s: mouse down in the title bar, a small drag so
+the window is actually held, the "Move left/right a space" shortcut, then the drag undone,
+mouse up, and the cursor put back. The window is then set back to its exact original
+position, since undoing the drag doesn't reliably land it on the same pixel. Steps run
+through `asyncAfter` so the main thread stays free. A press made mid-sequence is queued
+(latest only) and runs when the move finishes.
+
+The private calls that only *read* do still work, and the `Spaces` enum at the bottom of
+`WindowManager.swift` uses them, each looked up with `dlsym` so a missing one just disables
+what depended on it:
+
+- `CGSCopyManagedDisplaySpaces` — whether there's a desktop on that side at all. If not, the
+  move beeps and never touches the mouse.
+- `CGSGetSymbolicHotKeyValue` / `CGSIsSymbolicHotKeyEnabled` / `CGSSetSymbolicHotKeyEnabled`
+  (hot keys 79 and 81) — the keys the shortcut is actually set to, and switching it on for
+  the duration of the move if it's off.
+- `_AXUIElementGetWindow` + `CGSCopySpacesForWindows` — when the window has arrived. A window
+  being carried is on no Space, then on the new one once the switch completes (about 0.3s),
+  and the mouse is released then. Without these it falls back to a fixed 0.45s wait.
 
 Where a title bar can be dragged from varies by app, so `titleBarGrabPoints` offers several
 candidates: just right of the zoom button first (the safe spot in apps with a standard title
@@ -194,7 +224,7 @@ it didn't, the pointer is dragged off the top of the window before releasing (so
 doesn't complete a click) and the next candidate is tried. If none takes hold, nothing is
 sent and the desktop doesn't switch.
 
-It first waits up to 0.6s for the hotkey's modifiers to be released, since a click with `⌃`
+It first waits up to 0.3s for the hotkey's modifiers to be released, since a click with `⌃`
 held is a right-click. The events also set their flags explicitly, for anyone still holding
 them after that. Native full-screen windows are skipped, because the `⌃`-arrow would switch
 desktops without taking the window along.
@@ -264,7 +294,8 @@ actually copy themselves.
 - **Add a new bindable action**: add a case to `ShortcutAction`, give it a `scope`,
   `section`, `displayName`, and `defaultBinding`, then handle it in
   `AppDelegate.perform(_:)` (global scope) or `LauncherView.handleLauncherAction(_:)`
-  (launcher scope).
+  (launcher scope). A global action is also offered in the launcher by name unless
+  `isLauncherCommand` excludes it; give it `searchAliases` and a `symbolName`.
 - **Add a script language**: add a case to the extension switch in
   `SearchEngine.searchScripts`/`executeScript`, and to `scriptExtensions`.
 
@@ -278,6 +309,6 @@ actually copy themselves.
 - `EmojiDatabase` is a small hardcoded list, not the full Unicode emoji set.
 - Window tiling requires Accessibility permission and will no-op (with a logged reason) for
   windows that don't expose settable AX position/size, such as native full-screen windows.
-- Moving a window between desktops needs the system's "Move left/right a space" shortcuts
-  enabled, and clicks blindly beside the zoom button, so a control placed there in an unusual
-  title bar would receive the click.
+- Moving a window between desktops takes over the mouse for about half a second, and relies
+  on private SkyLight calls to know when the window has arrived (it falls back to fixed
+  timing without them).

@@ -32,8 +32,11 @@ across displays.
 - **Window tiling** — snap the active window to halves, corners, thirds, two-thirds, or
   maximize/center it, and move it between displays or desktops — all via global hotkeys, no
   launcher needed.
+- **Window commands** — every window action can also be run by name from the launcher: type
+  `next desktop`, `left half`, or `maximize` and press Return. It acts on the window that was
+  in front when the launcher opened.
 - **Themes** — switch the launcher and Settings between built-in themes, or create your own
-  with a custom appearance, accent color, and launcher background.
+  with a custom appearance, accent color, launcher background, and icon style.
 - **Fully customizable shortcuts** — every action has a default binding but can be
   re-recorded in Settings, with conflict detection per scope.
 - **Quick Links** — name a URL, file, or folder once in Settings and find it by name from the
@@ -96,10 +99,12 @@ All tiling shortcuts default to Magnet's scheme: `⌃⌥` (Control+Option) plus 
 
 All of the above — plus every launcher shortcut — can be changed in **Settings → Shortcuts**.
 
-Moving a window to another desktop simulates holding its title bar and pressing `⌃←` or `⌃→`,
-so "Move left a space" and "Move right a space" must stay enabled in System Settings →
-Keyboard → Keyboard Shortcuts → Mission Control (they are by default). Your cursor briefly
-jumps to the window and returns. It doesn't work on full-screen windows.
+Moving a window to another desktop holds its title bar and presses the system's "Move left a
+space" / "Move right a space" shortcut for you (System Settings → Keyboard → Keyboard
+Shortcuts → Mission Control), whatever keys it's set to, switching it on for the moment if
+you've turned it off. Your cursor briefly jumps to the window and returns. Pressing the
+shortcut again mid-move queues a second move; at the last desktop it just beeps. It doesn't
+work on full-screen windows.
 
 ## Settings
 
@@ -119,7 +124,9 @@ Open Settings from the menu bar's right-click menu, the launcher's gear icon, or
 - **Themes** — pick a built-in theme, or create, edit, and delete your own. Appearance and
   accent color apply to the launcher and Settings; everything else applies to the launcher:
   background (blur level, color or gradient, opacity), text and border colors, typeface,
-  corner radius, row size, and how the selected result is highlighted.
+  corner radius, row size, how the selected result is highlighted, and icons (full color,
+  monochrome, or tinted with the accent color; an optional backdrop; size; accent-colored
+  symbols).
 
 ## Privacy
 

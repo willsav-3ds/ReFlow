@@ -850,6 +850,19 @@ private struct ThemeEditor: View {
                         .padding(4)
                     }
 
+                    GroupBox("Icons") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            menu("App & file icons", \.iconStyle, name: \.displayName)
+                            menu("Backdrop", \.iconBackdrop, name: \.displayName)
+                            HStack {
+                                Text("Size")
+                                Slider(value: field(\.iconScale), in: 0.7...1.3)
+                            }
+                            Toggle("Use the accent color for symbol icons", isOn: field(\.tintsSymbolIcons))
+                        }
+                        .padding(4)
+                    }
+
                     GroupBox("Layout") {
                         VStack(alignment: .leading, spacing: 8) {
                             menu("Typeface", \.fontDesign, name: \.displayName)
@@ -892,8 +905,9 @@ private struct ThemePreview: View {
                 Divider()
             }
 
-            row("Selected result", icon: "app.fill", badge: "App", isSelected: true)
-            row("Another result", icon: "doc.fill", badge: "File", isSelected: false)
+            // One of each kind of icon a theme can restyle: a real app icon and a symbol.
+            row("Selected result", artwork: .fileIcon(IconCache.shared.icon(for: "/System/Applications/Notes.app")), badge: "App", isSelected: true)
+            row("Another result", artwork: .symbol("rectangle.righthalf.inset.filled"), badge: "Window", isSelected: false)
         }
         .themedSurface(theme, accent: accent, scale: 0.6)
         // With no border of its own, outline the preview so a theme close to the Settings
@@ -906,10 +920,9 @@ private struct ThemePreview: View {
         }
     }
 
-    private func row(_ title: String, icon: String, badge: String, isSelected: Bool) -> some View {
+    private func row(_ title: String, artwork: ThemedIcon.Artwork, badge: String, isSelected: Bool) -> some View {
         HStack(spacing: 8) {
-            Image(systemName: icon)
-                .foregroundStyle(.secondary)
+            ThemedIcon(artwork: artwork, theme: theme, accent: accent, isSelected: isSelected, baseSize: theme.density.iconSize * 0.6)
             Text(title)
                 .font(.system(size: theme.density.titleFontSize - 1, weight: .medium))
             Spacer()
