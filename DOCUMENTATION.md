@@ -41,7 +41,7 @@ WindowManager — AX-based window tiling, invoked directly by AppDelegate.perfor
 | `WindowManager.swift` | `WindowManager` singleton: all window-tiling geometry plus the Accessibility-API plumbing to read/move the frontmost window |
 | `Shortcuts.swift` | `KeyBinding`, `ShortcutAction` (every bindable action, its scope/section/display name/default), `ShortcutStore` (persisted bindings + conflict detection), `HotKeyCenter` (Carbon global-hotkey registration) |
 | `SettingsView.swift` | The `Settings` scene: one tab per feature area (Shortcuts, Scripts, File Search, Quick Links, Stickers, Clipboard, Themes) |
-| `ThemeStore.swift` | `Theme` model, built-in themes, persisted custom themes and active theme; applies appearance through `NSApp.appearance`; `ThemeBackground` (the launcher's backdrop) |
+| `ThemeStore.swift` | `Theme` model, built-in themes, persisted custom themes and active theme; applies appearance through `NSApp.appearance`; `ThemeBackground` (the launcher's backdrop) and the `themedSurface`/`themedRowHighlight` modifiers shared by the launcher and the Settings preview. `Theme` decodes by hand so themes saved before a property existed still load |
 | `RankingStore.swift` | Persists per-item usage counts and turns them into a small relevance boost |
 | `QuickLinkStore.swift` | `QuickLink` model + persisted store; `QuickLinkStore.open(_:)` opens a URL or filesystem path |
 | `ClipboardPaste.swift` | The paste mechanism: snapshot the pasteboard → set new contents → reactivate the previously-frontmost app → simulate `⌘V` → restore the original pasteboard |
@@ -166,6 +166,11 @@ private API:
   - Explicitly checks `AXUIElementIsAttributeSettable` first and skips (with a log line)
     windows that can't be resized via AX at all — e.g. one in native full-screen.
 
+- **Settle checks** (`scheduleSettleChecks`): 0.15s, 0.4s and 0.8s after a tile is applied,
+  the window's frame is read again and re-fitted inside the visible area if it has moved or
+  resized since — Music ends up hanging off the screen edge a moment after being tiled to
+  the right half. A newer tiling request, or the user holding a mouse button, cancels them.
+
 All tiling failures are logged to stderr with the `ReFlow[tiling]:` prefix rather than failing
 silently, to make diagnosing a misbehaving target app possible.
 
@@ -173,10 +178,21 @@ silently, to make diagnosing a misbehaving target app possible.
 
 There's no public API for moving a window to another Space, so
 `moveActiveWindowToAdjacentDesktop` simulates the manual gesture with `CGEvent`s: mouse down
-just right of the zoom button (a fixed offset from the corner if the window reports none),
-a small drag so the window is actually held, `⌃←`/`⌃→`, a wait for the switch animation,
-then the drag undone, mouse up, and the cursor put back. Steps run through `asyncAfter` so
-the main thread stays free, and `isMovingBetweenDesktops` drops presses made mid-sequence.
+in the title bar, a small drag so the window is actually held, `⌃←`/`⌃→`, a wait for the
+switch animation, then the drag undone, mouse up, and the cursor put back. The window is
+then set back to its exact original position, since undoing the drag doesn't reliably land
+it on the same pixel. Steps run through `asyncAfter` so the main thread stays free, and
+`isMovingBetweenDesktops` drops presses made mid-sequence.
+
+Where a title bar can be dragged from varies by app, so `titleBarGrabPoints` offers several
+candidates: just right of the zoom button first (the safe spot in apps with a standard title
+bar), then further along the same row, then the thin strip above it. Points Accessibility
+reports as controls are dropped. That can't catch everything — Claude's desktop app draws
+its own title bar with a sidebar button beside the window controls, and reports nothing
+there — so `grabWindow` confirms each press by checking the window moved with the drag. If
+it didn't, the pointer is dragged off the top of the window before releasing (so the press
+doesn't complete a click) and the next candidate is tried. If none takes hold, nothing is
+sent and the desktop doesn't switch.
 
 It first waits up to 0.6s for the hotkey's modifiers to be released, since a click with `⌃`
 held is a right-click. The events also set their flags explicitly, for anyone still holding

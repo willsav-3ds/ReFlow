@@ -708,13 +708,23 @@ private struct ThemeSwatch: View {
 
     var body: some View {
         Circle()
-            .fill(theme.background?.color ?? Color.secondary.opacity(0.3))
+            .fill(fill)
             .overlay {
                 Circle()
                     .fill(theme.accent?.color ?? Color.accentColor)
                     .padding(4)
             }
             .frame(width: 16, height: 16)
+    }
+
+    private var fill: AnyShapeStyle {
+        guard let background = theme.background else {
+            return AnyShapeStyle(Color.secondary.opacity(0.3))
+        }
+        guard let end = theme.backgroundEnd else {
+            return AnyShapeStyle(background.color)
+        }
+        return AnyShapeStyle(LinearGradient(colors: [background.color, end.color], startPoint: .topLeading, endPoint: .bottomTrailing))
     }
 }
 
@@ -755,9 +765,34 @@ private struct ThemeEditor: View {
         )
     }
 
+    /// A toggle for an optional color, with its color well alongside while it's on.
+    private func colorRow(_ title: String, _ keyPath: WritableKeyPath<Theme, ThemeColor?>, fallback: NSColor) -> some View {
+        HStack {
+            Toggle(title, isOn: isEnabled(keyPath, fallback: fallback))
+            Spacer()
+            if store.activeTheme[keyPath: keyPath] != nil {
+                ColorPicker(title, selection: pickerColor(keyPath), supportsOpacity: false)
+                    .labelsHidden()
+            }
+        }
+    }
+
+    private func menu<Option: CaseIterable & Identifiable & Hashable>(
+        _ title: String,
+        _ keyPath: WritableKeyPath<Theme, Option>,
+        name: @escaping (Option) -> String
+    ) -> some View where Option.AllCases: RandomAccessCollection {
+        Picker(title, selection: field(keyPath)) {
+            ForEach(Option.allCases) { option in
+                Text(name(option)).tag(option)
+            }
+        }
+    }
+
     var body: some View {
+        let theme = store.activeTheme
         VStack(alignment: .leading, spacing: 12) {
-            ThemePreview(theme: store.activeTheme, accent: store.accentColor)
+            ThemePreview(theme: theme, accent: store.accentColor)
 
             if store.isActiveThemeBuiltIn {
                 HStack {
@@ -771,44 +806,68 @@ private struct ThemeEditor: View {
                 }
             }
 
-            VStack(alignment: .leading, spacing: 12) {
-                TextField("Name", text: field(\.name))
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    TextField("Name", text: field(\.name))
 
-                Picker("Appearance", selection: field(\.appearance)) {
-                    ForEach(ThemeAppearance.allCases) { appearance in
-                        Text(appearance.displayName).tag(appearance)
+                    Picker("Appearance", selection: field(\.appearance)) {
+                        ForEach(ThemeAppearance.allCases) { appearance in
+                            Text(appearance.displayName).tag(appearance)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    GroupBox("Colors") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            colorRow("Custom accent color", \.accent, fallback: .controlAccentColor)
+                            colorRow("Custom text color", \.text, fallback: .labelColor)
+                            colorRow("Border", \.border, fallback: .controlAccentColor)
+                            if theme.border != nil {
+                                HStack {
+                                    Text("Border width")
+                                    Slider(value: field(\.borderWidth), in: 0.5...4)
+                                }
+                            }
+                        }
+                        .padding(4)
+                    }
+
+                    GroupBox("Background") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            menu("Material", \.material, name: \.displayName)
+                            colorRow("Custom launcher background", \.background, fallback: .windowBackgroundColor)
+                            if theme.background != nil {
+                                colorRow("Fade into a second color", \.backgroundEnd, fallback: .controlAccentColor)
+                                if theme.backgroundEnd != nil {
+                                    menu("Direction", \.gradientDirection, name: \.displayName)
+                                }
+                                HStack {
+                                    Text("Opacity")
+                                    Slider(value: field(\.backgroundOpacity), in: 0.2...1)
+                                }
+                            }
+                        }
+                        .padding(4)
+                    }
+
+                    GroupBox("Layout") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            menu("Typeface", \.fontDesign, name: \.displayName)
+                            menu("Selection", \.selectionStyle, name: \.displayName)
+                            menu("Row size", \.density, name: \.displayName)
+                            HStack {
+                                Text("Corner radius")
+                                Slider(value: field(\.cornerRadius), in: 0...28)
+                            }
+                            Toggle("Show result type labels", isOn: field(\.showsTypeBadges))
+                            Toggle("Show divider under the search field", isOn: field(\.showsDivider))
+                        }
+                        .padding(4)
                     }
                 }
-                .pickerStyle(.segmented)
-
-                HStack {
-                    Toggle("Custom accent color", isOn: isEnabled(\.accent, fallback: .controlAccentColor))
-                    Spacer()
-                    if store.activeTheme.accent != nil {
-                        ColorPicker("Accent color", selection: pickerColor(\.accent), supportsOpacity: false)
-                            .labelsHidden()
-                    }
-                }
-
-                HStack {
-                    Toggle("Custom launcher background", isOn: isEnabled(\.background, fallback: .windowBackgroundColor))
-                    Spacer()
-                    if store.activeTheme.background != nil {
-                        ColorPicker("Launcher background", selection: pickerColor(\.background), supportsOpacity: false)
-                            .labelsHidden()
-                    }
-                }
-
-                if store.activeTheme.background != nil {
-                    HStack {
-                        Text("Opacity")
-                        Slider(value: field(\.backgroundOpacity), in: 0.2...1)
-                    }
-                }
+                .padding(.trailing, 4)
+                .disabled(store.isActiveThemeBuiltIn)
             }
-            .disabled(store.isActiveThemeBuiltIn)
-
-            Spacer()
         }
     }
 }
@@ -829,40 +888,44 @@ private struct ThemePreview: View {
             }
             .padding(10)
 
-            Divider()
-
-            HStack(spacing: 8) {
-                Image(systemName: "app.fill")
-                    .foregroundStyle(.secondary)
-                Text("Selected result")
-                    .font(.system(size: 13, weight: .medium))
-                Spacer()
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .background(accent.opacity(0.15))
-            .overlay(alignment: .leading) {
-                Rectangle()
-                    .fill(accent)
-                    .frame(width: 3)
+            if theme.showsDivider {
+                Divider()
             }
 
-            HStack(spacing: 8) {
-                Image(systemName: "doc.fill")
-                    .foregroundStyle(.secondary)
-                Text("Another result")
-                    .font(.system(size: 13, weight: .medium))
-                Spacer()
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
+            row("Selected result", icon: "app.fill", badge: "App", isSelected: true)
+            row("Another result", icon: "doc.fill", badge: "File", isSelected: false)
         }
-        .background(ThemeBackground(theme: theme))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .themedSurface(theme, accent: accent, scale: 0.6)
+        // With no border of its own, outline the preview so a theme close to the Settings
+        // window's own color doesn't blend into it.
         .overlay {
-            RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(Color.secondary.opacity(0.3))
+            if theme.border == nil {
+                RoundedRectangle(cornerRadius: theme.cornerRadius * 0.6, style: .continuous)
+                    .strokeBorder(Color.secondary.opacity(0.3))
+            }
         }
+    }
+
+    private func row(_ title: String, icon: String, badge: String, isSelected: Bool) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .foregroundStyle(.secondary)
+            Text(title)
+                .font(.system(size: theme.density.titleFontSize - 1, weight: .medium))
+            Spacer()
+            if theme.showsTypeBadges {
+                Text(badge)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(.quaternary)
+                    .clipShape(Capsule())
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, theme.density.rowVerticalPadding)
+        .themedRowHighlight(theme, accent: accent, isSelected: isSelected, isHovering: false)
     }
 }
 

@@ -322,14 +322,26 @@ class WindowManager {
             print("ReFlow[desktops]: window is in native full screen — can't move it to another desktop.")
             return
         }
-        guard let grabPoint = titleBarGrabPoint(of: window) else {
+        guard let originalFrame = currentAXFrame(of: window) else { return }
+        let grabPoints = titleBarGrabPoints(of: window, frame: originalFrame)
+        guard !grabPoints.isEmpty else {
             print("ReFlow[desktops]: window's title bar isn't on any screen — can't grab it.")
             return
         }
 
         isMovingBetweenDesktops = true
+        // The simulated drag moves the window on purpose; a settle check still pending
+        // from an earlier tile shouldn't fight it.
+        tileGeneration += 1
+        let move = DesktopMove(
+            window: window,
+            originalFrame: originalFrame,
+            arrowKeyCode: arrowKeyCode,
+            source: CGEventSource(stateID: .privateState),
+            originalCursorLocation: CGEvent(source: nil)?.location
+        )
         whenModifiersReleased(deadline: Date().addingTimeInterval(0.6)) { [weak self] in
-            self?.performDesktopMove(grabPoint: grabPoint, arrowKeyCode: arrowKeyCode)
+            self?.grabWindow(for: move, at: grabPoints[...])
         }
     }
 
@@ -349,51 +361,142 @@ class WindowManager {
         }
     }
 
-    private func performDesktopMove(grabPoint: CGPoint, arrowKeyCode: CGKeyCode) {
-        let source = CGEventSource(stateID: .privateState)
-        let originalCursorLocation = CGEvent(source: nil)?.location
+    /// Everything one move between desktops needs to carry from step to step.
+    private struct DesktopMove {
+        let window: TileTarget
+        /// Where the window was before it was grabbed, in AX coordinates. Used both to tell
+        /// whether a grab took hold and to put the window back exactly afterward.
+        let originalFrame: CGRect
+        let arrowKeyCode: CGKeyCode
+        let source: CGEventSource?
+        let originalCursorLocation: CGPoint?
+    }
 
-        func postMouse(_ type: CGEventType, at point: CGPoint) {
-            guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: .left) else { return }
-            event.flags = []
-            // Always a single click, so repeating the shortcut quickly can't register as a
-            // double-click on the title bar, which would zoom or minimize the window.
-            if type != .mouseMoved {
-                event.setIntegerValueField(.mouseEventClickState, value: 1)
-            }
-            event.post(tap: .cghidEventTap)
+    private func postMouse(_ type: CGEventType, at point: CGPoint, for move: DesktopMove) {
+        guard let event = CGEvent(mouseEventSource: move.source, mouseType: type, mouseCursorPosition: point, mouseButton: .left) else { return }
+        event.flags = []
+        // Always a single click, so repeating the shortcut quickly can't register as a
+        // double-click on the title bar, which would zoom or minimize the window.
+        if type != .mouseMoved {
+            event.setIntegerValueField(.mouseEventClickState, value: 1)
         }
+        event.post(tap: .cghidEventTap)
+    }
 
-        // Real arrow-key events carry the function and numeric-pad flags too, and the
-        // system's Space-switching shortcut is registered with the function flag included.
-        func postArrow(keyDown: Bool) {
-            guard let event = CGEvent(keyboardEventSource: source, virtualKey: arrowKeyCode, keyDown: keyDown) else { return }
-            event.flags = [.maskControl, .maskSecondaryFn, .maskNumericPad]
-            event.post(tap: .cghidEventTap)
+    // Real arrow-key events carry the function and numeric-pad flags too, and the
+    // system's Space-switching shortcut is registered with the function flag included.
+    private func postArrow(keyDown: Bool, for move: DesktopMove) {
+        guard let event = CGEvent(keyboardEventSource: move.source, virtualKey: move.arrowKeyCode, keyDown: keyDown) else { return }
+        event.flags = [.maskControl, .maskSecondaryFn, .maskNumericPad]
+        event.post(tap: .cghidEventTap)
+    }
+
+    /// Presses at the first of `grabPoints` and drags a few pixels, then checks whether the
+    /// window actually followed. Where a title bar can be dragged from varies by app, and
+    /// can't always be worked out up front: Claude's desktop app and others that draw
+    /// their own title bar put buttons right beside the window controls, and pressing
+    /// there holds a button rather than the window. So rather than trust one spot, try
+    /// each in turn until the window moves.
+    private func grabWindow(for move: DesktopMove, at grabPoints: ArraySlice<CGPoint>) {
+        guard let grabPoint = grabPoints.first else {
+            print("ReFlow[desktops]: couldn't find anywhere on the title bar that drags the window — leaving it where it is.")
+            finishDesktopMove(move)
+            return
         }
 
         // A plain mouse-down isn't always treated as holding the window — it takes actual
-        // movement. The offset is undone before letting go, so the window lands where it was.
-        let draggedPoint = CGPoint(x: grabPoint.x + 4, y: grabPoint.y)
-
+        // movement. The offset is undone before letting go.
+        let draggedPoint = CGPoint(x: grabPoint.x + 6, y: grabPoint.y)
         let steps: [(delay: TimeInterval, action: () -> Void)] = [
-            (0, { postMouse(.mouseMoved, at: grabPoint) }),
-            (0.03, { postMouse(.leftMouseDown, at: grabPoint) }),
-            (0.08, { postMouse(.leftMouseDragged, at: draggedPoint) }),
-            (0.06, { postArrow(keyDown: true) }),
-            (0.03, { postArrow(keyDown: false) }),
-            // Long enough for the desktop-switch animation, so the window is still held
-            // when it finishes rather than getting dropped on the desktop being left.
-            (0.45, { postMouse(.leftMouseDragged, at: grabPoint) }),
-            (0.03, { postMouse(.leftMouseUp, at: grabPoint) }),
-            (0.03, { [weak self] in
-                if let originalCursorLocation {
-                    postMouse(.mouseMoved, at: originalCursorLocation)
+            (0, { [self] in postMouse(.mouseMoved, at: grabPoint, for: move) }),
+            (0.03, { [self] in postMouse(.leftMouseDown, at: grabPoint, for: move) }),
+            (0.06, { [self] in postMouse(.leftMouseDragged, at: CGPoint(x: grabPoint.x + 3, y: grabPoint.y), for: move) }),
+            (0.02, { [self] in postMouse(.leftMouseDragged, at: draggedPoint, for: move) }),
+            (0.05, { [self] in
+                confirmWindowHeld(for: move, checksLeft: 3) { [self] isHeld in
+                    if isHeld {
+                        carryWindow(for: move, heldAt: grabPoint)
+                    } else {
+                        releaseWithoutClicking(for: move, pressedAt: grabPoint) { [self] in
+                            grabWindow(for: move, at: grabPoints.dropFirst())
+                        }
+                    }
                 }
-                self?.isMovingBetweenDesktops = false
             }),
         ]
         runSteps(steps[...])
+    }
+
+    /// The window has been dragged a few pixels if it's held, so it's held exactly when
+    /// its position has changed. Checked a few times, since an app can take a moment to
+    /// report where its window has been dragged to.
+    private func confirmWindowHeld(for move: DesktopMove, checksLeft: Int, _ completion: @escaping (Bool) -> Void) {
+        if let origin = currentAXFrame(of: move.window)?.origin,
+           abs(origin.x - move.originalFrame.minX) >= 1 || abs(origin.y - move.originalFrame.minY) >= 1 {
+            completion(true)
+            return
+        }
+        guard checksLeft > 1 else {
+            completion(false)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.confirmWindowHeld(for: move, checksLeft: checksLeft - 1, completion)
+        }
+    }
+
+    /// Lets go of whatever the press landed on instead of the window. Releasing in place
+    /// would complete a click on it (toggling a sidebar, say), so the pointer is first
+    /// dragged up off the top of the window, where a release doesn't count as one.
+    private func releaseWithoutClicking(for move: DesktopMove, pressedAt grabPoint: CGPoint, then next: @escaping () -> Void) {
+        let outsidePoint = CGPoint(x: grabPoint.x, y: move.originalFrame.minY - 4)
+        let steps: [(delay: TimeInterval, action: () -> Void)] = [
+            (0, { [self] in postMouse(.leftMouseDragged, at: outsidePoint, for: move) }),
+            (0.03, { [self] in postMouse(.leftMouseUp, at: outsidePoint, for: move) }),
+            (0.05, next),
+        ]
+        runSteps(steps[...])
+    }
+
+    private func carryWindow(for move: DesktopMove, heldAt grabPoint: CGPoint) {
+        let steps: [(delay: TimeInterval, action: () -> Void)] = [
+            (0, { [self] in postArrow(keyDown: true, for: move) }),
+            (0.03, { [self] in postArrow(keyDown: false, for: move) }),
+            // Long enough for the desktop-switch animation, so the window is still held
+            // when it finishes rather than getting dropped on the desktop being left.
+            (0.45, { [self] in postMouse(.leftMouseDragged, at: grabPoint, for: move) }),
+            (0.03, { [self] in postMouse(.leftMouseUp, at: grabPoint, for: move) }),
+            (0.05, { [self] in
+                restoreOriginalPosition(for: move)
+                finishDesktopMove(move)
+            }),
+            // Dragging back to the grab point doesn't reliably undo the drag to the pixel,
+            // and the window can still be settling onto its new desktop when it's let go,
+            // so put it back where it started once more after things have calmed down.
+            (0.25, { [self] in
+                guard !isMovingBetweenDesktops, NSEvent.pressedMouseButtons == 0 else { return }
+                restoreOriginalPosition(for: move)
+            }),
+        ]
+        runSteps(steps[...])
+    }
+
+    private func restoreOriginalPosition(for move: DesktopMove) {
+        guard let current = currentAXFrame(of: move.window),
+              current.origin != move.originalFrame.origin else { return }
+        switch move.window {
+        case .accessibility(let window):
+            setPosition(move.originalFrame.origin, of: window)
+        case .own(let window):
+            window.setFrameOrigin(screenSpaceFrame(fromAX: move.originalFrame).origin)
+        }
+    }
+
+    private func finishDesktopMove(_ move: DesktopMove) {
+        if let originalCursorLocation = move.originalCursorLocation {
+            postMouse(.mouseMoved, at: originalCursorLocation, for: move)
+        }
+        isMovingBetweenDesktops = false
     }
 
     /// Runs each step after its delay without blocking the main thread: ReFlow has to stay
@@ -412,39 +515,85 @@ class WindowManager {
         return (value as? Bool) == true
     }
 
-    /// A point in the window's title bar that's safe to click, in the AX/CoreGraphics
-    /// coordinate space mouse events use. Just right of the zoom button is the most reliable
-    /// empty spot: the middle of the title bar is often a tab or toolbar control in apps
-    /// like browsers, where a click would do something else. Falls back to a fixed offset
-    /// from the corner for windows that don't report a zoom button.
-    private func titleBarGrabPoint(of target: TileTarget) -> CGPoint? {
-        let frame: CGRect
+    /// Points in the window's title bar worth trying to drag it by, most promising first,
+    /// in the AX/CoreGraphics coordinate space mouse events use. Just right of the zoom
+    /// button is the most reliable empty spot in apps with a standard title bar: the middle
+    /// is often a tab or toolbar control in apps like browsers, where a click would do
+    /// something else. Apps that draw their own title bar tend to be the other way around
+    /// (controls beside the zoom button, empty space further along), so the rest of the
+    /// row follows, then the thin strip above where controls usually sit.
+    ///
+    /// Anything Accessibility identifies as a control is left out. That can't catch
+    /// everything — a web-based app often reports nothing more specific than its window —
+    /// which is why `grabWindow` still checks that each press really took hold.
+    private func titleBarGrabPoints(of target: TileTarget, frame: CGRect) -> [CGPoint] {
         var zoomButtonFrame: CGRect?
-        switch target {
-        case .accessibility(let window):
-            guard let windowFrame = getWindowFrame(window) else { return nil }
-            frame = windowFrame
+        var appElement: AXUIElement?
+        if case .accessibility(let window) = target {
             var zoomButton: CFTypeRef?
             if AXUIElementCopyAttributeValue(window, kAXZoomButtonAttribute as CFString, &zoomButton) == .success,
                let zoomButton {
                 zoomButtonFrame = getWindowFrame(zoomButton as! AXUIElement)
             }
-        case .own(let window):
-            frame = axFrame(fromScreenSpace: window.frame)
-        }
-
-        var point = CGPoint(x: frame.minX + 80, y: frame.minY + 14)
-        if let zoomButtonFrame {
-            let besideZoomButton = CGPoint(x: zoomButtonFrame.maxX + 6, y: zoomButtonFrame.midY)
-            if frame.contains(besideZoomButton) {
-                point = besideZoomButton
+            var pid: pid_t = 0
+            if AXUIElementGetPid(window, &pid) == .success {
+                appElement = AXUIElementCreateApplication(pid)
             }
         }
 
-        // Flipped only to check it against `NSScreen`, as a zero-size rect at the point.
-        let screenSpacePoint = screenSpaceFrame(fromAX: CGRect(origin: point, size: .zero)).origin
-        guard NSScreen.screens.contains(where: { $0.frame.contains(screenSpacePoint) }) else { return nil }
-        return point
+        var besideWindowControls = CGPoint(x: frame.minX + 80, y: frame.minY + 14)
+        if let zoomButtonFrame {
+            let besideZoomButton = CGPoint(x: zoomButtonFrame.maxX + 6, y: zoomButtonFrame.midY)
+            if frame.contains(besideZoomButton) {
+                besideWindowControls = besideZoomButton
+            }
+        }
+
+        let rowY = besideWindowControls.y
+        let stripY = frame.minY + 5
+        var points = [besideWindowControls]
+        points += [0.5, 0.35, 0.65, 0.8].map { CGPoint(x: frame.minX + frame.width * $0, y: rowY) }
+        points += [0.5, 0.25, 0.75].map { CGPoint(x: frame.minX + frame.width * $0, y: stripY) }
+
+        return points.filter { point in
+            guard frame.contains(point) else { return false }
+            // Flipped only to check it against `NSScreen`, as a zero-size rect at the point.
+            let screenSpacePoint = screenSpaceFrame(fromAX: CGRect(origin: point, size: .zero)).origin
+            guard NSScreen.screens.contains(where: { $0.frame.contains(screenSpacePoint) }) else { return false }
+            guard let appElement else { return true }
+            return !isControl(at: point, in: appElement)
+        }
+    }
+
+    private static let controlRoles: Set<String> = [
+        kAXButtonRole, kAXMenuButtonRole, kAXPopUpButtonRole, kAXRadioButtonRole, kAXCheckBoxRole,
+        kAXTextFieldRole, kAXTextAreaRole, kAXComboBoxRole, kAXSliderRole, kAXIncrementorRole,
+        kAXDisclosureTriangleRole, kAXColorWellRole, kAXScrollBarRole, "AXLink",
+    ]
+
+    /// Whether pressing at `point` would land on a control, going by the element
+    /// Accessibility reports there and its nearest few ancestors (a button's label or icon
+    /// is often an element of its own). An unanswered query counts as "no": better to try
+    /// the point than to rule out a title bar the app just doesn't describe.
+    private func isControl(at point: CGPoint, in appElement: AXUIElement) -> Bool {
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(appElement, Float(point.x), Float(point.y), &hit) == .success else { return false }
+
+        var element = hit
+        for _ in 0..<4 {
+            guard let current = element else { break }
+            var roleValue: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(current, kAXRoleAttribute as CFString, &roleValue) == .success,
+                  let role = roleValue as? String else { break }
+            if role == kAXWindowRole { break }
+            if Self.controlRoles.contains(role) { return true }
+
+            var parent: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(current, kAXParentAttribute as CFString, &parent) == .success,
+                  let parent, CFGetTypeID(parent) == AXUIElementGetTypeID() else { break }
+            element = (parent as! AXUIElement)
+        }
+        return false
     }
 
     // MARK: - Helper Methods
@@ -584,6 +733,16 @@ class WindowManager {
         }
     }
 
+    /// The target's current frame in the AX coordinate space, however it's reached.
+    private func currentAXFrame(of target: TileTarget) -> CGRect? {
+        switch target {
+        case .accessibility(let window):
+            return getWindowFrame(window)
+        case .own(let window):
+            return axFrame(fromScreenSpace: window.frame)
+        }
+    }
+
     /// Returns the window's frame in the Accessibility API's own coordinate space: origin at
     /// the top-left of the primary screen, Y increasing *downward*. Don't compare this directly
     /// against `NSScreen.frame`/`.visibleFrame` — those use AppKit's space (origin at the
@@ -664,6 +823,7 @@ class WindowManager {
         // pending so a fast burst of presses resolves to a single, clean apply of the
         // last one, instead of every intermediate press racing to actually take effect.
         pendingWindowFrameWork?.cancel()
+        tileGeneration += 1
         let workItem = DispatchWorkItem { [weak self] in
             switch window {
             case .accessibility(let axWindow):
@@ -688,6 +848,52 @@ class WindowManager {
             pendingWindowFrameWork = nil
             workItem.perform()
         }
+    }
+
+    /// Bumped by every new tiling request (and move between desktops), so settle checks
+    /// left over from an earlier one stand down instead of dragging the window back.
+    private var tileGeneration = 0
+    private static let settleCheckDelays: [TimeInterval] = [0.15, 0.4, 0.8]
+
+    /// Some apps keep adjusting their window after a tile has been applied and verified.
+    /// Music is the one this was seen with: tiled to the right half it sits fully in view,
+    /// then a moment later ends up hanging off the edge — consistent with it settling on
+    /// its minimum size late and growing from its top-left corner. Nothing reports that,
+    /// so look again a few times shortly afterward and re-fit the window if it's no longer
+    /// where a window of its size belongs. For a window that stayed put, each check is a
+    /// single frame read.
+    private func scheduleSettleChecks(for window: AXUIElement, target screenSpaceFrame: CGRect, within bounds: CGRect) {
+        let generation = tileGeneration
+        for delay in Self.settleCheckDelays {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.tileGeneration == generation else { return }
+                // A held mouse button means the user has already taken over the window —
+                // leave it alone from here on.
+                guard NSEvent.pressedMouseButtons == 0 else {
+                    self.tileGeneration += 1
+                    return
+                }
+                guard let landed = self.getWindowFrame(window) else { return }
+                let fitted = self.axFrame(fromScreenSpace: self.fittedFrame(size: landed.size, target: screenSpaceFrame, bounds: bounds))
+                guard !self.framesMatch(landed, fitted) else { return }
+                print("ReFlow[tiling]: window drifted to \(landed) after tiling — re-placing it at \(fitted.origin) to keep it fully visible.")
+                self.setPosition(fitted.origin, of: window)
+            }
+        }
+    }
+
+    /// Moves a window without touching its size, working around "AXEnhancedUserInterface"
+    /// the same way `applyWindowFrame` does.
+    private func setPosition(_ origin: CGPoint, of window: AXUIElement) {
+        let wasEnhancedUIEnabled = setEnhancedUserInterface(for: window, enabled: false)
+        defer {
+            if let wasEnhancedUIEnabled, wasEnhancedUIEnabled {
+                _ = setEnhancedUserInterface(for: window, enabled: true)
+            }
+        }
+        var position = origin
+        let positionValue = AXValueCreate(.cgPoint, &position)!
+        AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, positionValue)
     }
 
     private func applyOwnWindowFrame(_ window: NSWindow, frame screenSpaceFrame: CGRect, within bounds: CGRect) {
@@ -775,6 +981,9 @@ class WindowManager {
         // size at the *old* vertical position, phase 2 then slides it into place, and
         // each read-back retry can nudge it again. That path is still there for whatever
         // doesn't land here — Safari's stale-value reconciliation, minimum-size windows.
+        // However the window gets there, check back on it afterward: see `scheduleSettleChecks`.
+        defer { scheduleSettleChecks(for: window, target: screenSpaceFrame, within: bounds) }
+
         if writeDirectly(targetFrame, to: window) {
             return
         }

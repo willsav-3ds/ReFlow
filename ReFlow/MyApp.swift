@@ -341,12 +341,19 @@ final class LauncherWindowController: NSObject, ObservableObject, NSWindowDelega
         // normal key dispatch the way one owned by a background app does, so the
         // keystroke could fall through to the search field instead of firing the hotkey.
         panel.makeKeyAndOrderFront(nil)
+        panel.invalidateShadow()
         isVisible = true
     }
 
     func hide() {
         panel.orderOut(nil)
         isVisible = false
+    }
+
+    /// For when the launcher's outline changes (a theme with different corners), since the
+    /// shadow is drawn around whatever shape the contents had when it was last computed.
+    func invalidateShadow() {
+        panel.invalidateShadow()
     }
 
     /// Opens directly into emoji/sticker search — or, if already open, just flips between

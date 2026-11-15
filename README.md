@@ -117,7 +117,9 @@ Open Settings from the menu bar's right-click menu, the launcher's gear icon, or
   alongside emoji.
 - **Clipboard** — enable/disable Clipboard History and clear it.
 - **Themes** — pick a built-in theme, or create, edit, and delete your own. Appearance and
-  accent color apply to the launcher and Settings; the background applies to the launcher.
+  accent color apply to the launcher and Settings; everything else applies to the launcher:
+  background (blur level, color or gradient, opacity), text and border colors, typeface,
+  corner radius, row size, and how the selected result is highlighted.
 
 ## Privacy
 

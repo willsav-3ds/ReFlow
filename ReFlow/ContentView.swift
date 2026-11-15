@@ -64,14 +64,16 @@ struct LauncherView: View {
             .padding()
             .background(WindowDragHandle())
 
-            Divider()
+            if theme.showsDivider {
+                Divider()
+            }
 
             // Results list
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(Array(searchEngine.results.enumerated()), id: \.element.id) { index, result in
-                            ResultRow(result: result, isSelected: index == searchEngine.selectedIndex, accent: themes.accentColor)
+                            ResultRow(result: result, isSelected: index == searchEngine.selectedIndex, theme: theme, accent: themes.accentColor)
                                 .id(result.id)
                                 .contentShape(Rectangle())
                                 // Files open on click like every other result. This used to
@@ -126,9 +128,13 @@ struct LauncherView: View {
                 }
             }
         }
-        .background(ThemeBackground(theme: themes.activeTheme))
-        .tint(themes.accentColor)
         .frame(width: 600, height: 450)
+        .themedSurface(theme, accent: themes.accentColor)
+        // The panel's shadow follows the shape of its contents, but is only worked out
+        // again when asked.
+        .onChange(of: theme.cornerRadius) {
+            windowController.invalidateShadow()
+        }
         .onChange(of: searchText) { _, newValue in
             searchEngine.search(query: newValue)
         }
@@ -155,6 +161,8 @@ struct LauncherView: View {
             searchEngine.search(query: "")
         }
     }
+
+    private var theme: Theme { themes.activeTheme }
 
     // MARK: - Keyboard-driven top-result actions
 
@@ -341,34 +349,36 @@ private struct FileDragSource: ViewModifier {
 struct ResultRow: View {
     let result: SearchResult
     let isSelected: Bool
+    let theme: Theme
     let accent: Color
     @State private var isHovering = false
     
     var body: some View {
+        let iconSize = theme.density.iconSize
         HStack(spacing: 12) {
             // Icon
             if let icon = result.icon ?? result.iconPath.map(IconCache.shared.icon(for:)) {
                 Image(nsImage: icon)
                     .resizable()
-                    .frame(width: 32, height: 32)
+                    .frame(width: iconSize, height: iconSize)
             } else if let emoji = result.emoji {
                 Text(emoji)
-                    .font(.system(size: 32))
-                    .frame(width: 32, height: 32)
+                    .font(.system(size: iconSize))
+                    .frame(width: iconSize, height: iconSize)
             } else {
                 Image(systemName: result.systemIcon ?? "questionmark.circle")
-                    .font(.system(size: 24))
-                    .frame(width: 32, height: 32)
+                    .font(.system(size: iconSize * 0.75))
+                    .frame(width: iconSize, height: iconSize)
                     .foregroundStyle(.secondary)
             }
             
             VStack(alignment: .leading, spacing: 2) {
                 Text(result.title)
-                    .font(.system(size: 14, weight: .medium))
+                    .font(.system(size: theme.density.titleFontSize, weight: .medium))
                 
                 if let subtitle = result.subtitle {
                     Text(subtitle)
-                        .font(.system(size: 11))
+                        .font(.system(size: theme.density.subtitleFontSize))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -378,27 +388,19 @@ struct ResultRow: View {
             Spacer()
             
             // Type badge
-            Text(result.type.displayName)
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(.quaternary)
-                .clipShape(Capsule())
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(
-            isHovering ? accent.opacity(0.1) :
-            isSelected ? accent.opacity(0.15) : Color.clear
-        )
-        .overlay(alignment: .leading) {
-            if isSelected {
-                Rectangle()
-                    .fill(accent)
-                    .frame(width: 3)
+            if theme.showsTypeBadges {
+                Text(result.type.displayName)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(.quaternary)
+                    .clipShape(Capsule())
             }
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, theme.density.rowVerticalPadding)
+        .themedRowHighlight(theme, accent: accent, isSelected: isSelected, isHovering: isHovering)
         .onHover { hovering in
             isHovering = hovering
         }
