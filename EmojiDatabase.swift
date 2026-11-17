@@ -6,8 +6,10 @@ struct EmojiEntry {
     let relevance: Double
 }
 
-/// A small hardcoded set of common emoji, plus hard-to-type symbols (math, arrows,
-/// typography, currency, Mac key glyphs). Easy to extend with more entries later.
+/// A hand-picked set of common emoji and hard-to-type symbols (math, arrows, typography,
+/// currency, Mac key glyphs), followed by the rest of the Unicode emoji set from
+/// `EmojiData`. The hand-picked ones come first so they lead the empty-query list and win
+/// relevance ties.
 final class EmojiDatabase {
     static let shared = EmojiDatabase()
 
@@ -16,7 +18,9 @@ final class EmojiDatabase {
         let keywords: [String]
     }
 
-    private let entries: [Entry] = [
+    private let entries: [Entry]
+
+    private static let curated: [Entry] = [
         Entry(emoji: "😀", keywords: ["grinning", "smile", "happy"]),
         Entry(emoji: "😂", keywords: ["joy", "laugh", "crying", "lol"]),
         Entry(emoji: "😅", keywords: ["sweat", "smile", "relief", "phew"]),
@@ -159,6 +163,32 @@ final class EmojiDatabase {
         Entry(emoji: "⎋", keywords: ["escape", "esc", "key"]),
         Entry(emoji: "", keywords: ["apple", "logo"]),
     ]
+
+    private init() {
+        // "❤️" and "❤" are the same emoji with and without the variation selector.
+        func key(_ emoji: String) -> String { emoji.replacingOccurrences(of: "\u{FE0F}", with: "") }
+
+        var entries = Self.curated
+        var curatedIndex: [String: Int] = [:]
+        for (index, entry) in entries.enumerated() { curatedIndex[key(entry.emoji)] = index }
+
+        for line in EmojiData.table.split(separator: "\n") {
+            let fields = line.split(separator: "\t")
+            guard fields.count == 2 else { continue }
+            let emoji = String(fields[0])
+            let keywords = fields[1].split(separator: "|").map(String.init)
+
+            if let index = curatedIndex[key(emoji)] {
+                // Already hand-picked: keep its emoji and keywords, add the ones it lacks.
+                let existing = entries[index]
+                let extra = keywords.filter { !existing.keywords.contains($0) }
+                entries[index] = Entry(emoji: existing.emoji, keywords: existing.keywords + extra)
+            } else {
+                entries.append(Entry(emoji: emoji, keywords: keywords))
+            }
+        }
+        self.entries = entries
+    }
 
     func search(query: String) -> [EmojiEntry] {
         guard !query.isEmpty else {

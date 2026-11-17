@@ -48,7 +48,7 @@ WindowManager — AX-based window tiling, invoked directly by AppDelegate.perfor
 | `StickerStore.swift` | `Sticker` model + persisted store; copies added images/GIFs into Application Support; `NSImage.pngData()` and `NSPasteboard.readStickerContent()` helpers (keeps GIFs animated, downloading a browser-copied GIF from its address if needed) |
 | `ClipboardHistoryStore.swift` | Opt-in, in-memory-only clipboard history via pasteboard `changeCount` polling |
 | `CalculatorEngine.swift` | Hand-rolled recursive-descent arithmetic parser/evaluator backing the inline calculator |
-| `EmojiDatabase.swift` | Hardcoded emoji + keyword list, searched the same way as everything else |
+| `EmojiDatabase.swift` | Hand-picked emoji/symbols + keywords, merged with the full Unicode set from `ReFlow/EmojiData.swift`, searched the same way as everything else |
 
 ## Singletons vs. `@State`
 
@@ -287,7 +287,7 @@ actually copy themselves.
 
 ## Extending ReFlow
 
-- **Add a built-in emoji**: append an `Entry` to `EmojiDatabase.entries`.
+- **Add a built-in emoji or symbol**: append an `Entry` to `EmojiDatabase.curated` (the full Unicode emoji set is already in `EmojiData.table`).
 - **Add a new `SearchMode`**: extend the `SearchMode` enum (`SearchEngine.swift`), branch on
   it in `search(query:)`, and add a case to `searchBarIconName`/`searchBarPlaceholder` in
   `ContentView.swift`.
@@ -306,7 +306,7 @@ actually copy themselves.
   paste fine as an image into apps like Notes (`StickerStore.swift`).
 - Only real GIF files stay animated as stickers. Other animated formats, such as the animated
   WebP some GIF sites serve, are stored as a still image.
-- `EmojiDatabase` is a small hardcoded list, not the full Unicode emoji set.
+- `EmojiData` stops at Emoji 17.0 and leaves out skin-tone variants.
 - Window tiling requires Accessibility permission and will no-op (with a logged reason) for
   windows that don't expose settable AX position/size, such as native full-screen windows.
 - Moving a window between desktops takes over the mouse for about half a second, and relies
